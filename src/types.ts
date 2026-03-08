@@ -1,0 +1,84 @@
+// ─── Core Types ───────────────────────────────────────────────────────────────
+
+export interface VisionObject {
+  name: string;
+  description: string;
+  components: string[];
+  uxFlow: string[];
+  techConstraints: string[];
+  successMetrics: string[];
+  rawVision: string;
+}
+
+export type WorkerType = "code_gen" | "debugger" | "doc_writer" | "test_runner" | "file_ops";
+
+export type TaskStatus = "pending" | "running" | "complete" | "failed" | "escalated";
+
+export interface Task {
+  id: string;
+  description: string;
+  worker: WorkerType;
+  dependsOn: string[];
+  context: { files: string[]; notes: string };
+  status: TaskStatus;
+}
+
+export interface TaskGraph {
+  goal: string;
+  tasks: Task[];
+}
+
+export interface TaskResult {
+  taskId: string;
+  output: string;
+  confidence: number;
+  worker: WorkerType;
+}
+
+export type EvalAction = "accept" | "retry_with_context" | "replan" | "escalate";
+
+export interface TaskEvaluation {
+  taskId: string;
+  correctness: number;
+  goalAlignment: number;
+  efficiency: number;
+  uxImpact: number;
+  overall: number;
+  action: EvalAction;
+  notes: string;
+}
+
+export interface RunEvaluation {
+  taskEvaluations: TaskEvaluation[];
+  overallScore: number;
+  passed: boolean;
+  summary: string;
+}
+
+// ─── Simulator Types ──────────────────────────────────────────────────────────
+
+export type TechLevel = "novice" | "hobbyist" | "developer";
+
+export interface Persona {
+  name: string;
+  description: string;
+  techLevel: TechLevel;
+}
+
+export interface SimulationStep {
+  step: number;
+  action: string;
+  outcome: string;
+  friction: number;   // 0-10
+  confusion: number;  // 0-10
+}
+
+export interface PersonaSimulation {
+  persona: Persona;
+  steps: SimulationStep[];
+  overallFriction: number;
+  overallConfusion: number;
+  timeToSuccess: number;
+  blockers: string[];
+  delights: string[];
+}
