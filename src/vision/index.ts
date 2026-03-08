@@ -27,7 +27,7 @@ Respond ONLY with JSON (no explanation):
   "successMetrics": ["metric1", "metric2"]
 }`;
 
-  const raw = await generate(prompt, { model: "mistral:7b", temperature: 0.7 });
+  const raw = await generate(prompt, { model: "qwen3:14b", temperature: 0.7 });
 
   const parsed = parseJsonSafe<Partial<VisionObject>>(raw, {});
 

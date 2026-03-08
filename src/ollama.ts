@@ -7,8 +7,9 @@ export interface OllamaOptions {
   num_ctx?: number;
 }
 
-const DEFAULT_MODEL = "mistral:7b";
-const OLLAMA_BASE = "http://127.0.0.1:11434";
+const DEFAULT_MODEL = "qwen3:14b";
+// Windows host Ollama (6900XT) — accessible from WSL2 via host gateway IP
+const OLLAMA_BASE = "http://172.30.176.1:11434";
 
 export async function generate(prompt: string, opts: OllamaOptions = {}): Promise<string> {
   const model = opts.model ?? DEFAULT_MODEL;
@@ -35,17 +36,26 @@ export async function generate(prompt: string, opts: OllamaOptions = {}): Promis
   return data.response;
 }
 
+export function stripThinking(text: string): string {
+  // qwen3 wraps reasoning in <think>...</think> before the actual response
+  return text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+}
+
 export function extractJson(text: string): string {
+  // Strip qwen3 thinking tokens first
+  text = stripThinking(text);
+
   // Strip ```json ... ``` fences if present
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenced) return fenced[1].trim();
 
-  // Extract first {...} or [...] block
-  const objMatch = text.match(/\{[\s\S]*\}/);
-  if (objMatch) return objMatch[0];
-
+  // Extract first [...] block (arrays first — planner returns arrays)
   const arrMatch = text.match(/\[[\s\S]*\]/);
   if (arrMatch) return arrMatch[0];
+
+  // Then objects
+  const objMatch = text.match(/\{[\s\S]*\}/);
+  if (objMatch) return objMatch[0];
 
   return text;
 }

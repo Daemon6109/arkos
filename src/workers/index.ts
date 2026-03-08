@@ -13,27 +13,27 @@ interface WorkerConfig {
 
 const WORKER_CONFIG: Record<WorkerType, WorkerConfig> = {
   code_gen: {
-    model: "qwen2.5-coder:7b",
+    model: "qwen3:14b",
     systemPrompt:
       "You are a code generation specialist. Write clean, working, well-structured code for the given task. Include comments for clarity.",
   },
   debugger: {
-    model: "mistral:7b",
+    model: "qwen3:8b",
     systemPrompt:
       "You are a debugging specialist. Identify errors and produce minimal, correct patches. Explain the root cause briefly.",
   },
   doc_writer: {
-    model: "mistral:7b",
+    model: "qwen3:8b",
     systemPrompt:
       "You are a documentation specialist. Write clear, concise documentation targeted at the intended audience.",
   },
   test_runner: {
-    model: "mistral:7b",
+    model: "qwen3:8b",
     systemPrompt:
       "You are a testing specialist. Write comprehensive tests covering edge cases. Focus on correctness and coverage.",
   },
   file_ops: {
-    model: "mistral:7b",
+    model: "qwen3:8b",
     systemPrompt:
       "You are a file operations specialist. Handle file system tasks precisely and safely.",
   },

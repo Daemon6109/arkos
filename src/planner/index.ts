@@ -60,7 +60,7 @@ Respond ONLY with a JSON array:
   {"description": "write documentation", "worker": "doc_writer", "dependsOn": [2]}
 ]`;
 
-  const raw = await generate(prompt, { model: "mistral:7b", temperature: 0.5 });
+  const raw = await generate(prompt, { model: "qwen3:14b", temperature: 0.5 });
 
   type RawTask = { description: string; worker: string; dependsOn: number[] };
   const rawTasks = parseJsonSafe<RawTask[]>(raw, []);
