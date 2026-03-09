@@ -1,15 +1,19 @@
 // ─── Arkos HTTP Server ────────────────────────────────────────────────────────
-// Runs Arkos as a persistent service. Claude delegates coding tasks here
-// instead of generating code itself — saves API costs, uses local 6900XT GPU.
+// Persistent Node.js HTTP server. Claude delegates coding tasks here instead
+// of writing code itself — saves API costs, runs on local 6900XT GPU.
 
 import { run } from "../kernel/index.js";
 import { getStats } from "../memory/index.js";
 import { randomUUID } from "crypto";
+import { createServer } from "http";
+import type { IncomingMessage, ServerResponse } from "http";
+import { readdirSync } from "fs";
+import { join } from "path";
 
 const OLLAMA_HOST = "172.30.176.1:11434";
 const startTime = Date.now();
 
-// ── Job tracking ──────────────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface RunJob {
   runId: string;
@@ -22,232 +26,213 @@ interface RunJob {
   acceptancePassed?: boolean;
   error?: string;
   logs: string[];
-  logListeners: Set<(line: string) => void>;
+  listeners: Set<(line: string) => void>;
   startedAt: number;
   finishedAt?: number;
 }
 
+// ── State ─────────────────────────────────────────────────────────────────────
+
 const jobs = new Map<string, RunJob>();
 let isRunning = false;
-const queue: string[] = [];
+const jobQueue: string[] = [];
 
-// ── Console capture ───────────────────────────────────────────────────────────
+// ── Queue ─────────────────────────────────────────────────────────────────────
 
-function captureConsoleTo(job: RunJob) {
-  const original = console.log.bind(console);
-  console.log = (...args: unknown[]) => {
-    const line = args.map(String).join(" ");
-    original(line);
-    job.logs.push(line);
-    job.logListeners.forEach(fn => fn(line));
-  };
-  return () => { console.log = original; };
+function pushLog(job: RunJob, line: string) {
+  job.logs.push(line);
+  job.listeners.forEach(fn => fn(line));
 }
 
-// ── Job queue ─────────────────────────────────────────────────────────────────
-
 async function processQueue() {
-  if (isRunning || queue.length === 0) return;
-  const runId = queue.shift()!;
+  if (isRunning || jobQueue.length === 0) return;
+  const runId = jobQueue.shift()!;
   const job = jobs.get(runId);
   if (!job) return;
 
   isRunning = true;
   job.status = "running";
-  const restore = captureConsoleTo(job);
+
+  const origLog = console.log.bind(console);
+  console.log = (...args: unknown[]) => {
+    const line = args.map(String).join(" ");
+    origLog(line);
+    pushLog(job, line);
+  };
 
   try {
-    await run(job.goal, {
-      skipSimulation: true,
-      language: job.language,
-      verbose: false,
-    });
+    await run(job.goal, { skipSimulation: true, language: job.language, verbose: false });
 
-    // Pull result from latest output dir
-    const slug = job.goal
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-|-$/g, "")
-      .slice(0, 60);
+    const slug = job.goal.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
     const outputDir = `${process.env.HOME}/.arkos/output/${slug}`;
 
-    let files: string[] = [];
-    try {
-      const { readdirSync } = await import("fs");
-      const { join } = await import("path");
-      const walk = (dir: string): string[] => {
-        try {
-          return readdirSync(dir, { withFileTypes: true }).flatMap(e =>
-            e.isDirectory() ? walk(join(dir, e.name)) : [join(dir, e.name).replace(outputDir + "/", "")]
-          );
-        } catch { return []; }
-      };
-      files = walk(outputDir).filter(f => !f.includes("node_modules"));
-    } catch {}
+    const walk = (dir: string): string[] => {
+      try {
+        return readdirSync(dir, { withFileTypes: true }).flatMap(e =>
+          e.isDirectory() ? walk(join(dir, e.name)) : [join(dir, e.name).replace(outputDir + "/", "")]
+        );
+      } catch { return []; }
+    };
 
     job.status = "done";
     job.outputDir = outputDir;
-    job.files = files;
-    job.finishedAt = Date.now();
+    job.files = walk(outputDir).filter(f => !f.includes("node_modules"));
+
+    // Extract score from logs
+    const scoreLine = [...job.logs].reverse().find(l => l.includes("Score:"));
+    if (scoreLine) {
+      const m = scoreLine.match(/Score:\s*([\d.]+)/);
+      if (m) job.score = parseFloat(m[1]);
+    }
+    job.acceptancePassed = job.logs.some(l => l.includes("✅ All acceptance criteria met"));
 
   } catch (err) {
     job.status = "failed";
     job.error = String(err);
-    job.finishedAt = Date.now();
   } finally {
-    restore();
+    console.log = origLog;
+    job.finishedAt = Date.now();
+    pushLog(job, "__DONE__");
+    job.listeners.clear();
     isRunning = false;
-    // Notify all SSE listeners the stream is done
-    job.logListeners.forEach(fn => fn("__DONE__"));
-    job.logListeners.clear();
-    processQueue(); // pick up next job
+    setTimeout(processQueue, 100);
   }
 }
 
-// ── Route handlers ────────────────────────────────────────────────────────────
-
-function handleStatus() {
-  return Response.json({
-    ok: true,
-    uptime: Math.floor((Date.now() - startTime) / 1000),
-    model: "qwen2.5-coder:14b / qwen3:14b",
-    ollamaHost: OLLAMA_HOST,
-    activeJob: isRunning,
-    queueLength: queue.length,
-  });
-}
-
-function handlePostRun(body: { goal: string; language?: string; sim?: boolean }) {
+function submitJob(goal: string, language = "TypeScript"): string {
   const runId = randomUUID();
   const job: RunJob = {
-    runId,
-    goal: body.goal,
-    language: body.language ?? "TypeScript",
-    status: "queued",
-    logs: [],
-    logListeners: new Set(),
-    startedAt: Date.now(),
+    runId, goal, language, status: "queued",
+    logs: [], listeners: new Set(), startedAt: Date.now(),
   };
   jobs.set(runId, job);
-  queue.push(runId);
+  jobQueue.push(runId);
   processQueue();
-  return Response.json({ runId, status: "queued" }, { status: 202 });
+  return runId;
 }
 
-function handleGetRun(runId: string) {
-  const job = jobs.get(runId);
-  if (!job) return Response.json({ error: "not found" }, { status: 404 });
-  const { logListeners, ...safe } = job;
-  return Response.json(safe);
-}
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-function handleStreamRun(runId: string) {
-  const job = jobs.get(runId);
-  if (!job) return Response.json({ error: "not found" }, { status: 404 });
-
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    start(controller) {
-      // Send buffered logs first
-      for (const line of job.logs) {
-        controller.enqueue(encoder.encode(`data: ${line}\n\n`));
-      }
-
-      if (job.status === "done" || job.status === "failed") {
-        controller.enqueue(encoder.encode(`data: __DONE__\n\n`));
-        controller.close();
-        return;
-      }
-
-      const listener = (line: string) => {
-        if (line === "__DONE__") {
-          controller.enqueue(encoder.encode(`data: __DONE__\n\n`));
-          controller.close();
-          job.logListeners.delete(listener);
-        } else {
-          controller.enqueue(encoder.encode(`data: ${line}\n\n`));
-        }
-      };
-      job.logListeners.add(listener);
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-      "Access-Control-Allow-Origin": "*",
-    },
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    req.on("error", reject);
   });
 }
 
-function handleGetRuns() {
-  const stats = getStats();
-  const recent = Array.from(jobs.values())
-    .sort((a, b) => b.startedAt - a.startedAt)
-    .slice(0, 10)
-    .map(({ logListeners, logs: _logs, ...j }) => j);
-  return Response.json({ stats, recent });
-}
-
-function handleDeleteRun(runId: string) {
-  const job = jobs.get(runId);
-  if (!job) return Response.json({ error: "not found" }, { status: 404 });
-  if (job.status === "queued") {
-    const idx = queue.indexOf(runId);
-    if (idx !== -1) queue.splice(idx, 1);
-    job.status = "failed";
-    job.error = "Cancelled";
-    return Response.json({ cancelled: true });
-  }
-  return Response.json({ error: "Cannot cancel a running job" }, { status: 409 });
+function send(res: ServerResponse, data: unknown, status = 200) {
+  res.writeHead(status, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+  res.end(JSON.stringify(data, null, 2));
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
 export function startServer(port = 3847) {
-  const server = Bun.serve({
-    port,
-    async fetch(req: Request) {
-      const url = new URL(req.url);
-      const path = url.pathname;
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    const pathname = (req.url ?? "/").split("?")[0];
+    const method = req.method ?? "GET";
 
-      // CORS preflight
-      if (req.method === "OPTIONS") {
-        return new Response(null, {
-          headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET,POST,DELETE" },
-        });
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    if (method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+
+    // POST /run
+    if (method === "POST" && pathname === "/run") {
+      const body = JSON.parse(await readBody(req) || "{}") as any;
+      const goal = String(body.goal ?? "").trim();
+      if (!goal) return send(res, { error: "goal is required" }, 400);
+      const runId = submitJob(goal, body.language ?? "TypeScript");
+      return send(res, { runId, status: "queued" }, 202);
+    }
+
+    // GET /run/:id/stream  — SSE
+    const streamMatch = pathname.match(/^\/run\/([^/]+)\/stream$/);
+    if (method === "GET" && streamMatch) {
+      const job = jobs.get(streamMatch[1]);
+      if (!job) return send(res, { error: "not found" }, 404);
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Access-Control-Allow-Origin": "*",
+      });
+
+      const emit = (line: string) => res.write(`data: ${line}\n\n`);
+
+      // replay buffered logs
+      for (const line of job.logs) emit(line);
+      if (job.status === "done" || job.status === "failed") { res.end(); return; }
+
+      job.listeners.add(emit);
+      req.on("close", () => { job.listeners.delete(emit); res.end(); });
+      return;
+    }
+
+    // GET /run/:id
+    const runMatch = pathname.match(/^\/run\/([^/]+)$/);
+    if (method === "GET" && runMatch) {
+      const job = jobs.get(runMatch[1]);
+      if (!job) return send(res, { error: "not found" }, 404);
+      return send(res, {
+        runId: job.runId, status: job.status, score: job.score,
+        outputDir: job.outputDir, files: job.files,
+        acceptancePassed: job.acceptancePassed, error: job.error,
+        logLines: job.logs.length, startedAt: job.startedAt, finishedAt: job.finishedAt,
+      });
+    }
+
+    // DELETE /run/:id — cancel queued job
+    if (method === "DELETE" && runMatch) {
+      const job = jobs.get(runMatch[1]);
+      if (!job) return send(res, { error: "not found" }, 404);
+      if (job.status === "queued") {
+        const i = jobQueue.indexOf(job.runId);
+        if (i !== -1) jobQueue.splice(i, 1);
+        job.status = "failed"; job.error = "cancelled";
+        return send(res, { ok: true });
       }
+      return send(res, { error: "cannot cancel a running job" }, 409);
+    }
 
-      if (req.method === "GET" && path === "/status") return handleStatus();
-      if (req.method === "GET" && path === "/runs") return handleGetRuns();
+    // GET /runs
+    if (method === "GET" && pathname === "/runs") {
+      const stats = getStats();
+      const recent = [...jobs.values()]
+        .sort((a, b) => b.startedAt - a.startedAt).slice(0, 10)
+        .map(j => ({ runId: j.runId, goal: j.goal.slice(0, 60), status: j.status, score: j.score }));
+      return send(res, { stats, recent });
+    }
 
-      if (req.method === "POST" && path === "/run") {
-        const body = await req.json().catch(() => ({}));
-        if (!body.goal) return Response.json({ error: "goal is required" }, { status: 400 });
-        return handlePostRun(body);
-      }
+    // GET /status
+    if (method === "GET" && pathname === "/status") {
+      const stats = getStats();
+      return send(res, {
+        ok: true,
+        uptime: Math.floor((Date.now() - startTime) / 1000),
+        isRunning, queued: jobQueue.length,
+        totalRuns: stats.total, avgScore: stats.avgScore,
+        model: "qwen2.5-coder:14b / qwen3:14b",
+        ollamaHost: OLLAMA_HOST, port,
+      });
+    }
 
-      const runMatch = path.match(/^\/run\/([^/]+)(\/stream)?$/);
-      if (runMatch) {
-        const runId = runMatch[1];
-        if (runMatch[2] === "/stream") return handleStreamRun(runId);
-        if (req.method === "GET") return handleGetRun(runId);
-        if (req.method === "DELETE") return handleDeleteRun(runId);
-      }
-
-      return Response.json({ error: "not found" }, { status: 404 });
-    },
+    send(res, { error: "not found" }, 404);
   });
 
-  console.log(`🚀 Arkos server running at http://localhost:${port}`);
-  console.log(`   POST /run          — submit a coding goal`);
-  console.log(`   GET  /run/:id      — check job status`);
-  console.log(`   GET  /run/:id/stream — stream live progress`);
-  console.log(`   GET  /runs         — recent run history`);
-  console.log(`   GET  /status       — server health`);
-  console.log(`\n   GPU: AMD 6900XT via Ollama at ${OLLAMA_HOST}`);
-  console.log(`   Models: qwen2.5-coder:14b (code) · qwen3:14b (planning)`);
+  server.listen(port, () => {
+    console.log(`🚀 Arkos server on http://localhost:${port}`);
+    console.log(`   POST   /run              submit a goal`);
+    console.log(`   GET    /run/:id          job status + result`);
+    console.log(`   GET    /run/:id/stream   SSE progress`);
+    console.log(`   DELETE /run/:id          cancel queued job`);
+    console.log(`   GET    /runs             recent history`);
+    console.log(`   GET    /status           health check`);
+  });
+
   return server;
 }
