@@ -151,8 +151,26 @@ export async function buildAndTest(
   return result;
 }
 
-// ─── Error fixer ──────────────────────────────────────────────────────────────
-// Sends compiler/test errors to qwen2.5-coder:14b, applies patches to files.
+// ─── Error fixer ──────────────────────────────────────────────────────────────────────────────
+// Sends compiler/test errors to qwen2.5-coder:14b, patches ALL affected files.
+
+/**
+ * Parse error output to extract all source file paths referenced in errors.
+ * Handles tsc-style:  src/scanner.ts(12,5): error TS...
+ * and bun/node-style: src/cli.ts:8:3 ...
+ */
+function parseAffectedFiles(errors: string): string[] {
+  const seen = new Set<string>();
+  const tscRe = /([^\s"']+\.(?:ts|tsx|js|jsx|mts|cts))\(\d+,\d+\)/g;
+  const bunRe = /([^\s"']+\.(?:ts|tsx|js|jsx|mts|cts)):\d+:\d+/g;
+  for (const re of [tscRe, bunRe]) {
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(errors)) !== null) {
+      if (m[1]) seen.add(m[1]);
+    }
+  }
+  return [...seen];
+}
 
 async function fixErrors(
   errors: string,
@@ -160,59 +178,95 @@ async function fixErrors(
   lang: string,
   errorType: string
 ): Promise<boolean> {
-  // Read all src files to give debugger full context
-  const srcFiles = await readSrcFiles(outputDir);
-  if (srcFiles.length === 0) return false;
+  // 1. Identify which files are mentioned in errors
+  const affectedPaths = parseAffectedFiles(errors);
 
-  const filesSection = srcFiles
-    .map(f => `// FILE: ${f.path}\n${f.content}`)
+  // 2. Collect affected files first, then supplement with all src for context
+  const filesToRead: Array<{ path: string; content: string }> = [];
+
+  if (affectedPaths.length > 0) {
+    for (const rel of affectedPaths) {
+      const full = join(outputDir, rel);
+      if (existsSync(full)) {
+        try {
+          filesToRead.push({ path: rel, content: await readFile(full, "utf-8") });
+        } catch { /* skip unreadable */ }
+      }
+    }
+  }
+
+  // Always include all src files for full context (deduplicated)
+  const srcFiles = await readSrcFiles(outputDir);
+  const existing = new Set(filesToRead.map((f) => f.path));
+  for (const sf of srcFiles) {
+    if (!existing.has(sf.path)) filesToRead.push(sf);
+  }
+
+  if (filesToRead.length === 0) return false;
+
+  const filesSection = filesToRead
+    .map((f) => `// FILE: ${f.path}\n${f.content}`)
     .join("\n\n---\n\n");
 
-  const prompt = `You are an expert ${lang} debugger. Fix these ${errorType}.
+  const affectedNote =
+    affectedPaths.length > 0
+      ? `Files with errors: ${affectedPaths.join(", ")}`
+      : "Fix all files that contain errors.";
+
+  const prompt = `You are an expert ${lang} debugger. Fix ALL of these ${errorType}.
+
+${affectedNote}
 
 ERRORS:
 ${errors.slice(0, 2000)}
 
 CURRENT SOURCE FILES:
-${filesSection.slice(0, 6000)}
+${filesSection.slice(0, 8000)}
 
-Return ONLY a JSON array of file patches. Each patch has the file path and complete corrected content:
+Return ONLY a JSON array of file patches. Each element has the relative file path and the COMPLETE corrected file content:
 [
   {
     "path": "src/scanner.ts",
     "content": "// complete corrected file content here"
+  },
+  {
+    "path": "src/cli.ts",
+    "content": "// complete corrected file content here"
   }
 ]
 
-Fix ONLY what's broken. Don't rewrite files that don't have errors.`;
+Include ALL files that need changes. Fix ONLY what's broken. Do not rewrite files that have no errors.`;
 
   try {
     const raw = await generate(prompt, {
       model: "qwen2.5-coder:14b",
       temperature: 0.2,
-      num_ctx: 12000,
+      num_ctx: 14000,
     }, "builder");
     const cleaned = stripThinking(raw);
 
     const jsonStr = (() => {
       const fenced = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
       if (fenced) return fenced[1].trim();
-      const s = cleaned.indexOf("["); const e = cleaned.lastIndexOf("]");
+      const s = cleaned.indexOf("[");
+      const e = cleaned.lastIndexOf("]");
       if (s !== -1 && e > s) return cleaned.slice(s, e + 1);
       return "[]";
     })();
 
     const patches: Array<{ path: string; content: string }> = JSON.parse(jsonStr);
 
+    let patchCount = 0;
     for (const patch of patches) {
       const fullPath = join(outputDir, patch.path);
       if (existsSync(fullPath) && patch.content) {
         await writeFile(fullPath, patch.content, "utf-8");
         console.log(`    🔧 patched ${patch.path}`);
+        patchCount++;
       }
     }
 
-    return patches.length > 0;
+    return patchCount > 0;
   } catch {
     return false;
   }

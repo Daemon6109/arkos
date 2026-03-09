@@ -14,6 +14,7 @@ import { buildAndTest } from "../builder/index.js";
 import { getStats, resetStats, printEfficiencyReport, saveEfficiencyReport } from "../optimizer/index.js";
 import { evaluate, CONFIDENCE_THRESHOLD, MAX_RETRIES } from "../evaluator/index.js";
 import { storeRun } from "../memory/index.js";
+import { ProjectMemory, getProjectContext } from "../memory/project.js";
 import { generate, stripThinking } from "../ollama.js";
 import type { TaskResult, TaskGraph } from "../types.js";
 import { join } from "path";
@@ -39,9 +40,20 @@ export async function run(goal: string, opts: RunOptions = {}): Promise<void> {
 
   // ── 1. Vision (memory-informed) ───────────────────────────────────────────
   console.log("[1/7] 👁️  Generating vision...");
-  const vision = await generateVision(goal);
+  let vision = await generateVision(goal);
   console.log(`  → ${vision.name}: ${vision.description}`);
   if (verbose) console.log("  Components:", vision.components.join(", "));
+
+  // ── Prior build context ───────────────────────────────────────────────────
+  const projectMemory = new ProjectMemory(outputDir);
+  const priorContext = await getProjectContext(outputDir);
+  if (priorContext) {
+    console.log(`  📂 Prior build found — injecting context into vision`);
+    vision = {
+      ...vision,
+      rawVision: `PRIOR BUILD: ${priorContext}\n\n${vision.rawVision}`,
+    };
+  }
 
   // ── 2. Scenario Simulation ────────────────────────────────────────────────
   let goals: import("../goals/index.js").ExtractedGoal[] = [];
@@ -131,6 +143,22 @@ export async function run(goal: string, opts: RunOptions = {}): Promise<void> {
 
   // ── Memory ────────────────────────────────────────────────────────────────
   await storeRun(goal, vision, evaluation);
+
+  // ── Project memory (per-directory) ────────────────────────────────────────
+  const lessons = evaluation.taskEvaluations
+    .filter((te) => te.notes)
+    .map((te) => `[${te.action}] ${te.notes}`);
+  await projectMemory.save({
+    goal,
+    timestamp: Date.now(),
+    files: graph.fileMap.map((f) => ({
+      path: f.path,
+      purpose: f.description,
+      exports: f.exports ?? [],
+    })),
+    lessons,
+    runScore: evaluation.overallScore,
+  });
 
   // ── Token efficiency report ───────────────────────────────────────────────
   const tokenStats = getStats();
