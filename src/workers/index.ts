@@ -16,6 +16,8 @@ export interface ExecutionContext {
   projectName: string;
   language: string;
   priorContext?: string;
+  /** Extra context injected by the solution solver on retry branches. Prepended to worker prompts. */
+  extraContext?: string;
 }
 
 // ─── Model assignments ────────────────────────────────────────────────────────
@@ -160,7 +162,10 @@ export async function executeGraph(
     const currentTier = getTaskTier(allReady[0].worker);
     const ready = allReady.filter(t => getTaskTier(t.worker) === currentTier);
 
-    const contextSnapshot = builtContext.join("\n\n");
+    const extraCtxPrefix = ctx.extraContext
+      ? `[SOLVER CONTEXT]\n${ctx.extraContext}\n\n`
+      : "";
+    const contextSnapshot = extraCtxPrefix + builtContext.join("\n\n");
 
     const fileMapSummary = graph.fileMap
       .map(f => `  ${f.path} — ${f.description} [exports: ${f.exports.join(", ") || "none"}]`)

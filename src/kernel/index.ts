@@ -17,6 +17,7 @@ import { storeRun } from "../memory/index.js";
 import { ProjectMemory, getProjectContext } from "../memory/project.js";
 import { generate, stripThinking } from "../ollama.js";
 import { generateCriteria, runAcceptance } from "../acceptance/index.js";
+import { SolutionSolver, mergeResults } from "../solver/index.js";
 import type { TaskResult, TaskGraph } from "../types.js";
 import { join } from "path";
 import { homedir } from "os";
@@ -108,13 +109,69 @@ export async function run(goal: string, opts: RunOptions = {}): Promise<void> {
     });
   }
 
-  // ── 6. Execute + Adaptive Retry ───────────────────────────────────────────
+  // ── 6. Execute + AIDE-style Solution Tree ────────────────────────────────
   console.log("[6/7] ⚙️   Executing tasks...");
   const ctx = { outputDir, projectName: vision.name, language };
   let results = await executeGraph(graph, ctx);
 
-  // Adaptive context retry loop
-  results = await adaptiveRetry(results, graph, ctx, verbose);
+  // AIDE-style solution tree — branch on failed tasks, keep best result
+  const solver = new SolutionSolver(4); // max 4 total attempts
+  let currentEval = await evaluate(results, graph);
+  let node = solver.createRoot(results, currentEval.overallScore, currentEval.passed);
+
+  if (verbose) {
+    console.log(`  🌳 Solver root: score=${currentEval.overallScore.toFixed(2)} passed=${currentEval.passed}`);
+  }
+
+  while (solver.shouldBranch(node)) {
+    const failedTaskIds = currentEval.taskEvaluations
+      .filter((te) => te.action !== "accept")
+      .map((te) => te.taskId);
+    const failedTasks = graph.tasks.filter((t) => failedTaskIds.includes(t.id));
+
+    const expansionCtx = solver.getExpansionContext(node);
+    const hint = `Retry with expanded context. ${expansionCtx}`;
+
+    console.log(
+      `  🌿 Branch ${node.attempt + 1}/${solver.size + 1}: retrying ${failedTasks.length} task(s) (score: ${node.score.toFixed(2)})`
+    );
+
+    // Reset failed tasks to pending for re-execution
+    for (const t of failedTasks) t.status = "pending";
+
+    // Re-execute only the failed tasks with expanded context
+    const retryResults = await executeGraph(
+      { ...graph, tasks: failedTasks },
+      { ...ctx, extraContext: hint }
+    );
+
+    // Merge: keep best output per task (highest confidence wins)
+    const mergedResults = mergeResults(results, retryResults);
+    const retryEval = await evaluate(mergedResults, graph);
+
+    const branch = solver.createBranch(node, failedTasks, hint);
+    solver.updateNode(branch, retryEval.overallScore, retryEval.passed, mergedResults);
+
+    results = mergedResults;
+    currentEval = retryEval;
+    node = branch;
+
+    if (verbose) {
+      console.log(
+        `  🌳 Branch result: score=${retryEval.overallScore.toFixed(2)} passed=${retryEval.passed}`
+      );
+    }
+  }
+
+  const best = solver.getBestNode();
+  if (best && best.results.length > 0) {
+    results = best.results;
+    if (verbose) {
+      console.log(
+        `  🏆 Best node: ${best.id} (score: ${best.score.toFixed(2)}, attempt: ${best.attempt})`
+      );
+    }
+  }
 
   // ── Assembly pass — writes package.json, tsconfig, wires project ──────────
   await assembleProject(graph, ctx);
