@@ -297,11 +297,161 @@ Reply with a brief assessment. If there are issues, start your reply with "ISSUE
 
 // ─── Pipeline ─────────────────────────────────────────────────────────────────
 
+// ─── Speculative Execution ────────────────────────────────────────────────────
+
+interface BranchVariant {
+  variant: "v1" | "v2" | "v3";
+  branchName: string;
+  skipImports: boolean;
+  applyVersionBumps: boolean;
+}
+
+interface BranchResult {
+  variant: "v1" | "v2" | "v3";
+  branchName: string;
+  score: number;
+  tscErrors: number;
+  tscOutput: string;
+  reposWithChanges: Set<string>;
+  modifiedFiles: Array<{ repoDir: string; path: string; repoName: string }>;
+  movedCount: number;
+  importUpdateCount: number;
+}
+
+/** Execute a single variant of the refactor plan on a set of cloned dirs */
+async function executePlanVariant(
+  variant: BranchVariant,
+  plan: RefactorPlan,
+  clonedDirs: Map<string, string>,
+  resolveRepo: (nameOrOwner: string) => string | undefined,
+  language: string,
+  goal: string
+): Promise<BranchResult> {
+  const result: BranchResult = {
+    variant: variant.variant,
+    branchName: variant.branchName,
+    score: 0,
+    tscErrors: -1,
+    tscOutput: "",
+    reposWithChanges: new Set(),
+    modifiedFiles: [],
+    movedCount: 0,
+    importUpdateCount: 0,
+  };
+
+  // Determine which repos have changes
+  for (const move of plan.filesToMove) {
+    const fromRepo = resolveRepo(move.fromRepo);
+    const toRepo = resolveRepo(move.toRepo);
+    if (fromRepo) result.reposWithChanges.add(fromRepo);
+    if (toRepo) result.reposWithChanges.add(toRepo);
+  }
+  if (!variant.skipImports) {
+    for (const imp of plan.importsToUpdate) {
+      const repo = resolveRepo(imp.repo);
+      if (repo) result.reposWithChanges.add(repo);
+    }
+  }
+  if (variant.applyVersionBumps) {
+    for (const bump of plan.versionBumps) {
+      const repo = resolveRepo(bump.repo);
+      if (repo) result.reposWithChanges.add(repo);
+    }
+  }
+
+  // Create branches
+  for (const repo of result.reposWithChanges) {
+    const dir = clonedDirs.get(repo)!;
+    await createBranch(dir, variant.branchName);
+  }
+
+  // Execute file moves
+  for (const move of plan.filesToMove) {
+    const fromRepo = resolveRepo(move.fromRepo);
+    const toRepo = resolveRepo(move.toRepo);
+    if (!fromRepo || !toRepo) continue;
+
+    const fromDir = clonedDirs.get(fromRepo)!;
+    const toDir = clonedDirs.get(toRepo)!;
+    const content = await readRepoFile(fromDir, move.path);
+    if (!content) continue;
+
+    await writeRepoFile(toDir, move.targetPath, content);
+    result.modifiedFiles.push({ repoDir: toDir, path: move.targetPath, repoName: repoShortName(toRepo) });
+    if (fromRepo !== toRepo) await deleteRepoFile(fromDir, move.path);
+    result.movedCount++;
+  }
+
+  // Update imports (unless conservative/skipImports)
+  if (!variant.skipImports) {
+    for (const imp of plan.importsToUpdate) {
+      const repo = resolveRepo(imp.repo);
+      if (!repo) continue;
+      const dir = clonedDirs.get(repo)!;
+      const content = await readRepoFile(dir, imp.file);
+      if (!content) continue;
+      if (content.includes(imp.oldImport)) {
+        const updated = content.split(imp.oldImport).join(imp.newImport);
+        await writeRepoFile(dir, imp.file, updated);
+        result.modifiedFiles.push({ repoDir: dir, path: imp.file, repoName: repoShortName(repo) });
+        result.importUpdateCount++;
+      }
+    }
+  }
+
+  // Apply version bumps (v3 only)
+  if (variant.applyVersionBumps) {
+    for (const bump of plan.versionBumps) {
+      const repo = resolveRepo(bump.repo);
+      if (!repo) continue;
+      const dir = clonedDirs.get(repo)!;
+      const content = await readRepoFile(dir, bump.packagePath);
+      if (!content) continue;
+      try {
+        const pkg = JSON.parse(content) as Record<string, unknown>;
+        pkg[bump.field] = bump.newValue;
+        await writeRepoFile(dir, bump.packagePath, JSON.stringify(pkg, null, 2) + "\n");
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Run tsc in each affected repo dir to score
+  try {
+    if (runTsc) {
+      let totalErrors = 0;
+      const tscLines: string[] = [];
+      for (const repo of result.reposWithChanges) {
+        const dir = clonedDirs.get(repo)!;
+        const tscResult = await runTsc(dir);
+        totalErrors += tscResult.errorCount;
+        tscLines.push(...tscResult.errors.map((e) => `${e.file}:${e.line}:${e.col} - ${e.message}`));
+      }
+      result.tscErrors = totalErrors;
+      result.tscOutput = tscLines.join("\n");
+      // Score: 2 pts if all pass, 1 pt if partial (<5 errors), 0 if more
+      if (totalErrors === 0) result.score = 2;
+      else if (totalErrors < 5) result.score = 1;
+      else result.score = 0;
+    } else {
+      // No tsc available — default to 1 (neutral, not penalized)
+      result.score = 1;
+      result.tscErrors = 0;
+    }
+  } catch (err) {
+    log(`  ⚠️  tsc check failed for ${variant.variant}: ${err instanceof Error ? err.message : String(err)}`);
+    result.score = 0;
+    result.tscErrors = 999;
+  }
+
+  return result;
+}
+
+// ─── Pipeline ─────────────────────────────────────────────────────────────────
+
 export async function runRefactor(opts: RefactorOptions): Promise<void> {
   const { repos, goal, language = "TypeScript", verbose = false } = opts;
   const shouldOpenPR = opts.openPR !== false; // default true
   const timestamp = Date.now();
-  const branchName = `arkos/refactor-${timestamp}`;
 
   if (repos.length < 2) {
     throw new Error("refactor requires at least 2 repos (--repos owner/repo1 owner/repo2)");
@@ -317,16 +467,28 @@ export async function runRefactor(opts: RefactorOptions): Promise<void> {
 
   // ── Helper: resolve ownerRepo from short or full name ──────────────────────
   function resolveRepo(nameOrOwner: string): string | undefined {
-    // Exact match (full ownerRepo)
     if (clonedDirs.has(nameOrOwner)) return nameOrOwner;
-    // Short name match
     const full = shortNameMap.get(nameOrOwner);
     if (full) return full;
-    // Fuzzy: find any repo whose short name contains nameOrOwner
     for (const [short, full] of shortNameMap) {
       if (short.includes(nameOrOwner) || nameOrOwner.includes(short)) return full;
     }
     return undefined;
+  }
+
+  // ── Step 0: Load prior refactor lessons from memory ────────────────────────
+  log("\n🧠 Step 0: Loading prior refactor lessons from memory...");
+  const allPriorLessons: string[] = [];
+  for (const repo of repos) {
+    try {
+      const lessons = await getRefactorLessons(repo, goal, 5);
+      if (lessons.length > 0) {
+        log(`  📚 ${repo}: ${lessons.length} prior lesson(s) found`);
+        allPriorLessons.push(...lessons.map((l) => `[${repo}] ${l}`));
+      }
+    } catch (err) {
+      log(`  ⚠️  Could not load lessons for ${repo}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // ── Step 1: Clone repos ────────────────────────────────────────────────────
@@ -366,15 +528,19 @@ export async function runRefactor(opts: RefactorOptions): Promise<void> {
     return;
   }
 
-  // ── Step 3b: Pass 2 — full plan with candidate contents ───────────────────
+  // ── Step 3b: Pass 2 — full plan with candidate contents + prior lessons ───
   log(`\n🔍 Step 3b: Pass 2 — deep analysis of ${candidates.length} candidate files...`);
+  if (allPriorLessons.length > 0) {
+    log(`  💡 Injecting ${allPriorLessons.length} prior lesson(s) into prompt`);
+  }
   const plan = await buildRefactorPlan(
     structures,
     candidates,
     goal,
     language,
     shortNameMap,
-    clonedDirs
+    clonedDirs,
+    allPriorLessons
   );
 
   if (verbose) log(`\n[PLAN]\n${JSON.stringify(plan, null, 2)}\n`);
@@ -391,133 +557,157 @@ export async function runRefactor(opts: RefactorOptions): Promise<void> {
     return;
   }
 
-  // ── Step 5: Execute ────────────────────────────────────────────────────────
-  log("\n⚙️  Step 5: Executing plan...");
+  // ── Step 5: Speculative execution — 3 parallel branches ───────────────────
+  log("\n🔀 Step 5: Speculative execution — running 3 branch variants...");
 
-  // Determine which repos have changes
-  const reposWithChanges = new Set<string>();
-  for (const move of plan.filesToMove) {
-    const fromRepo = resolveRepo(move.fromRepo);
-    const toRepo = resolveRepo(move.toRepo);
-    if (fromRepo) reposWithChanges.add(fromRepo);
-    if (toRepo) reposWithChanges.add(toRepo);
-  }
-  for (const imp of plan.importsToUpdate) {
-    const repo = resolveRepo(imp.repo);
-    if (repo) reposWithChanges.add(repo);
-  }
-  for (const bump of plan.versionBumps) {
-    const repo = resolveRepo(bump.repo);
-    if (repo) reposWithChanges.add(repo);
-  }
+  // We need separate clonedDirs for each variant (clone again into variant-specific dirs)
+  // For simplicity, we create variant copies by cloning fresh for each — or reuse with temp dirs.
+  // Strategy: clone 3 separate copies (v1, v2, v3) from the first clone via cp.
+  const { exec: cpExec } = await import("child_process");
+  const { promisify } = await import("util");
+  const execAsync = promisify(cpExec);
 
-  // Create branches in repos with changes
-  for (const repo of reposWithChanges) {
-    const dir = clonedDirs.get(repo)!;
-    log(`  🌿 Creating branch ${branchName} in ${repo}...`);
-    await createBranch(dir, branchName);
-  }
+  const variants: BranchVariant[] = [
+    { variant: "v1", branchName: `arkos/refactor-${timestamp}-v1`, skipImports: false, applyVersionBumps: false },
+    { variant: "v2", branchName: `arkos/refactor-${timestamp}-v2`, skipImports: true,  applyVersionBumps: false },
+    { variant: "v3", branchName: `arkos/refactor-${timestamp}-v3`, skipImports: false, applyVersionBumps: true  },
+  ];
 
-  // Track modified files for verification
-  const modifiedFiles: Array<{ repoDir: string; path: string; repoName: string }> = [];
-
-  // Execute file moves
-  let movedCount = 0;
-  for (const move of plan.filesToMove) {
-    const fromRepo = resolveRepo(move.fromRepo);
-    const toRepo = resolveRepo(move.toRepo);
-
-    if (!fromRepo || !toRepo) {
-      log(`  ⚠️  Could not find repos for move: ${move.fromRepo} → ${move.toRepo}, skipping`);
-      continue;
+  // Build variant-specific clonedDirs maps by copying the original clones
+  const variantClonedDirs: Map<"v1" | "v2" | "v3", Map<string, string>> = new Map();
+  for (const variant of variants) {
+    const vDirs = new Map<string, string>();
+    for (const [repo, originalDir] of clonedDirs) {
+      const vDir = `${originalDir}-${variant.variant}`;
+      try {
+        await execAsync(`cp -r ${originalDir} ${vDir}`);
+        vDirs.set(repo, vDir);
+      } catch (err) {
+        log(`  ⚠️  Could not copy ${repo} for ${variant.variant}: ${err instanceof Error ? err.message : String(err)}`);
+        vDirs.set(repo, originalDir); // fall back
+      }
     }
-
-    const fromDir = clonedDirs.get(fromRepo)!;
-    const toDir = clonedDirs.get(toRepo)!;
-
-    log(`  📁 Moving ${move.path} (${repoShortName(fromRepo)} → ${repoShortName(toRepo)})`);
-
-    const content = await readRepoFile(fromDir, move.path);
-    if (!content) {
-      log(`  ⚠️  Source file not found: ${move.path}, skipping`);
-      continue;
-    }
-
-    await writeRepoFile(toDir, move.targetPath, content);
-    modifiedFiles.push({ repoDir: toDir, path: move.targetPath, repoName: repoShortName(toRepo) });
-
-    if (fromRepo !== toRepo) {
-      await deleteRepoFile(fromDir, move.path);
-    }
-    movedCount++;
+    variantClonedDirs.set(variant.variant, vDirs);
   }
 
-  // Update imports
-  let importUpdateCount = 0;
-  for (const imp of plan.importsToUpdate) {
-    const repo = resolveRepo(imp.repo);
-    if (!repo) continue;
+  // Execute all 3 variants (in parallel)
+  log("  🏃 Executing v1 (full plan), v2 (skip imports), v3 (full plan + pkg version bump)...");
+  const branchResults = await Promise.all(
+    variants.map(async (variant) => {
+      const vDirs = variantClonedDirs.get(variant.variant)!;
+      function resolveRepoVariant(nameOrOwner: string): string | undefined {
+        if (vDirs.has(nameOrOwner)) return nameOrOwner;
+        const full = shortNameMap.get(nameOrOwner);
+        if (full) return full;
+        for (const [short, full] of shortNameMap) {
+          if (short.includes(nameOrOwner) || nameOrOwner.includes(short)) return full;
+        }
+        return undefined;
+      }
+      try {
+        return await executePlanVariant(variant, plan, vDirs, resolveRepoVariant, language, goal);
+      } catch (err) {
+        log(`  ⚠️  Variant ${variant.variant} failed: ${err instanceof Error ? err.message : String(err)}`);
+        return {
+          variant: variant.variant,
+          branchName: variant.branchName,
+          score: 0,
+          tscErrors: 999,
+          tscOutput: String(err),
+          reposWithChanges: new Set<string>(),
+          modifiedFiles: [],
+          movedCount: 0,
+          importUpdateCount: 0,
+        } as BranchResult;
+      }
+    })
+  );
 
-    const dir = clonedDirs.get(repo)!;
-    const content = await readRepoFile(dir, imp.file);
-    if (!content) continue;
+  // ── Step 5b: Score and pick winner ─────────────────────────────────────────
+  branchResults.sort((a, b) => b.score - a.score);
+  const winner = branchResults[0];
 
-    if (content.includes(imp.oldImport)) {
-      const updated = content.split(imp.oldImport).join(imp.newImport);
-      await writeRepoFile(dir, imp.file, updated);
-      modifiedFiles.push({ repoDir: dir, path: imp.file, repoName: repoShortName(repo) });
-      log(`  🔗 Updated import in ${imp.file}: "${imp.oldImport}" → "${imp.newImport}"`);
-      importUpdateCount++;
-    }
+  log("\n🏆 Branch scoring results:");
+  for (const r of branchResults) {
+    const isWinner = r.variant === winner.variant;
+    const tscLabel = r.tscErrors === -1
+      ? "tsc not available"
+      : r.tscErrors === 0
+        ? "tsc passed"
+        : `tsc: ${r.tscErrors} error${r.tscErrors !== 1 ? "s" : ""}`;
+    const prefix = isWinner ? "🏆 Best branch" : "  ";
+    log(`${prefix}: ${r.variant} (score: ${r.score}/2 — ${tscLabel})`);
   }
 
-  // Apply version bumps
-  for (const bump of plan.versionBumps) {
-    const repo = resolveRepo(bump.repo);
-    if (!repo) continue;
+  log(`\n✅ Winner: ${winner.variant} (score ${winner.score}/2)`);
 
-    const dir = clonedDirs.get(repo)!;
-    const content = await readRepoFile(dir, bump.packagePath);
-    if (!content) continue;
+  // ── Step 5c: Verify winner's modified files ────────────────────────────────
+  const vDirsWinner = variantClonedDirs.get(winner.variant)!;
+  // Remap modifiedFiles to use winner's dirs
+  const verifyIssues = await verifyModifiedFiles(winner.modifiedFiles, goal, language);
 
+  // ── Store lessons learned ──────────────────────────────────────────────────
+  for (const repo of repos) {
+    for (const issue of verifyIssues) {
+      try {
+        await storeRefactorLesson(repo, issue);
+      } catch { /* best-effort */ }
+    }
+    // Also store a summary lesson
     try {
-      const pkg = JSON.parse(content) as Record<string, unknown>;
-      pkg[bump.field] = bump.newValue;
-      await writeRepoFile(dir, bump.packagePath, JSON.stringify(pkg, null, 2) + "\n");
-      log(`  📦 Version bump in ${bump.packagePath}: ${bump.field} = ${bump.newValue}`);
-    } catch {
-      log(`  ⚠️  Could not parse ${bump.packagePath} for version bump`);
-    }
+      const scoreLabel = winner.score === 2 ? "tsc passed" : winner.score === 1 ? "partial tsc" : "tsc failed";
+      await storeRefactorLesson(repo, `Refactor "${goal.slice(0, 60)}": winner ${winner.variant} score ${winner.score}/2 — ${scoreLabel}`);
+    } catch { /* best-effort */ }
   }
 
-  // ── Step 5b: Verification ──────────────────────────────────────────────────
-  await verifyModifiedFiles(modifiedFiles, goal, language);
-
-  // ── Step 6: Create PRs ─────────────────────────────────────────────────────
+  // ── Step 6: Create PRs from winning branch ─────────────────────────────────
   const prUrls: string[] = [];
 
   if (shouldOpenPR) {
-    log("\n🚀 Step 6: Creating PRs...");
+    log(`\n🚀 Step 6: Creating PRs from winning branch (${winner.variant})...`);
 
-    for (const repo of reposWithChanges) {
-      const dir = clonedDirs.get(repo)!;
-      const shortName = repoShortName(repo);
+    for (const repo of winner.reposWithChanges) {
+      const dir = vDirsWinner.get(repo)!;
 
       const repoMoves = plan.filesToMove.filter(
-        (m) => resolveRepo(m.fromRepo) === repo || resolveRepo(m.toRepo) === repo
+        (m) => {
+          const fr = (() => {
+            if (vDirsWinner.has(m.fromRepo)) return m.fromRepo;
+            return shortNameMap.get(m.fromRepo) ?? m.fromRepo;
+          })();
+          const tr = (() => {
+            if (vDirsWinner.has(m.toRepo)) return m.toRepo;
+            return shortNameMap.get(m.toRepo) ?? m.toRepo;
+          })();
+          return fr === repo || tr === repo;
+        }
       );
-      const repoImports = plan.importsToUpdate.filter(
-        (i) => resolveRepo(i.repo) === repo
-      );
-      const repoBumps = plan.versionBumps.filter(
-        (b) => resolveRepo(b.repo) === repo
-      );
+      const repoImports = plan.importsToUpdate.filter((i) => {
+        const r = shortNameMap.get(i.repo) ?? i.repo;
+        return r === repo;
+      });
+      const repoBumps = plan.versionBumps.filter((b) => {
+        const r = shortNameMap.get(b.repo) ?? b.repo;
+        return r === repo;
+      });
+
+      const scoreSummary = branchResults
+        .map((r) => {
+          const tscLabel = r.tscErrors === 0 ? "tsc passed" : r.tscErrors < 0 ? "tsc unavailable" : `${r.tscErrors} error${r.tscErrors !== 1 ? "s" : ""}`;
+          return `- ${r.variant}: ${r.score}/2 (${tscLabel})`;
+        })
+        .join("\n");
 
       const prBody = `## Arkos Refactor
 
 **Goal:** ${goal}
 
 **Summary:** ${plan.summary}
+
+**Speculative Execution:** Best branch is \`${winner.variant}\` (score: ${winner.score}/2)
+\`\`\`
+${scoreSummary}
+\`\`\`
 
 ### Changes
 ${repoMoves.length > 0 ? `\n**File moves:**\n${repoMoves.map((m) => `- \`${m.path}\` → \`${m.targetPath}\` (${m.reason})`).join("\n")}` : ""}
@@ -528,7 +718,7 @@ ${repoBumps.length > 0 ? `\n**Version bumps:**\n${repoBumps.map((b) => `- \`${b.
 
       try {
         await commitAll(dir, `refactor: ${plan.summary}`);
-        await pushBranch(dir, branchName);
+        await pushBranch(dir, winner.branchName);
         const prUrl = await openPR(dir, `refactor: ${plan.summary}`, prBody);
         prUrls.push(prUrl);
         log(`  ✅ PR opened: ${prUrl}`);
@@ -539,13 +729,13 @@ ${repoBumps.length > 0 ? `\n**Version bumps:**\n${repoBumps.map((b) => `- \`${b.
       }
     }
   } else {
-    log("\n⏭️  Step 6: Skipped (--no-pr)");
-    log("  Changes committed to branches in:");
-    for (const repo of reposWithChanges) {
-      const dir = clonedDirs.get(repo)!;
+    log(`\n⏭️  Step 6: Skipped (--no-pr)`);
+    log(`  Changes are in branch ${winner.branchName} in:`);
+    for (const repo of winner.reposWithChanges) {
+      const dir = vDirsWinner.get(repo)!;
       try {
         await commitAll(dir, `refactor: ${plan.summary}`);
-        log(`    ✅ ${repo} → ${dir} (branch: ${branchName})`);
+        log(`    ✅ ${repo} → ${dir}`);
       } catch (err) {
         log(`    ⚠️  Commit failed for ${repo}: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -554,8 +744,9 @@ ${repoBumps.length > 0 ? `\n**Version bumps:**\n${repoBumps.map((b) => `- \`${b.
 
   // ── Step 7: Report ─────────────────────────────────────────────────────────
   log("\n✅ Refactor complete");
-  log(`  Moved ${movedCount} file${movedCount !== 1 ? "s" : ""}`);
-  log(`  Updated ${importUpdateCount} import path${importUpdateCount !== 1 ? "s" : ""}`);
+  log(`  Winner: ${winner.variant} (score: ${winner.score}/2)`);
+  log(`  Moved ${winner.movedCount} file${winner.movedCount !== 1 ? "s" : ""}`);
+  log(`  Updated ${winner.importUpdateCount} import path${winner.importUpdateCount !== 1 ? "s" : ""}`);
   if (prUrls.length > 0) {
     log("  PRs opened:");
     for (const url of prUrls) {
