@@ -32,11 +32,14 @@ const MODELS = {
 } as const;
 
 const WORKER_MODEL: Record<WorkerType, string> = {
-  code_gen:    MODELS.coder,
-  test_runner: MODELS.coder,
-  debugger:    MODELS.coder,
-  doc_writer:  MODELS.light,
-  file_ops:    MODELS.light,
+  code_gen:            MODELS.coder,
+  test_runner:         MODELS.coder,
+  debugger:            MODELS.coder,
+  doc_writer:          MODELS.light,
+  file_ops:            MODELS.light,
+  refactor_analyzer:   MODELS.reviewer,
+  refactor_planner:    MODELS.reviewer,
+  refactor_executor:   MODELS.coder,
 };
 
 // ─── File dependency graph validation ────────────────────────────────────────

@@ -10,7 +10,15 @@ export interface VisionObject {
   rawVision: string;
 }
 
-export type WorkerType = "code_gen" | "debugger" | "doc_writer" | "test_runner" | "file_ops";
+export type WorkerType =
+  | "code_gen"
+  | "debugger"
+  | "doc_writer"
+  | "test_runner"
+  | "file_ops"
+  | "refactor_analyzer"
+  | "refactor_planner"
+  | "refactor_executor";
 
 export type TaskStatus = "pending" | "running" | "complete" | "failed" | "escalated";
 

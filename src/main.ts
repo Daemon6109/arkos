@@ -4,6 +4,7 @@
 import { run } from "./kernel/index.js";
 import { getStats } from "./memory/index.js";
 import { startServer } from "./server/index.js";
+import { runRefactor } from "./refactor/index.js";
 
 const args = process.argv.slice(2);
 
@@ -12,12 +13,15 @@ if (args.length === 0 || args[0] === "help") {
 arkos — Cognitive AI orchestration engine
 
 Usage:
-  arkos run <goal>          Run a goal through the full pipeline
-  arkos run <goal> -v       Verbose output
-  arkos serve               Start HTTP API server (port 3847)
-  arkos serve --port 8080   Start on custom port
-  arkos status              Show memory stats
-  arkos help                Show this help
+  arkos run <goal>                          Run a goal through the full pipeline
+  arkos run <goal> -v                       Verbose output
+  arkos refactor "<goal>" --repos r1 r2     Cross-repo refactor analysis + PRs
+  arkos refactor "<goal>" --repos r1 r2 --no-pr   Refactor without opening PRs
+  arkos refactor "<goal>" --repos r1 r2 --lang TypeScript
+  arkos serve                               Start HTTP API server (port 3847)
+  arkos serve --port 8080                   Start on custom port
+  arkos status                              Show memory stats
+  arkos help                                Show this help
 `);
   process.exit(0);
 }
@@ -48,6 +52,56 @@ if (command === "run") {
 
   run(goal, { verbose, skipSimulation: skipSim, language }).catch((err) => {
     console.error("Arkos error:", err);
+    process.exit(1);
+  });
+} else if (command === "refactor") {
+  const verbose = args.includes("-v") || args.includes("--verbose");
+  const noPR = args.includes("--no-pr");
+
+  // --lang TypeScript
+  const langIdx = args.indexOf("--lang");
+  const language = langIdx !== -1 ? args[langIdx + 1] : "TypeScript";
+
+  // --repos owner/repo1 owner/repo2 ... (all args after --repos until next --flag or end)
+  const reposIdx = args.indexOf("--repos");
+  if (reposIdx === -1) {
+    console.error("Error: --repos required");
+    console.error('  arkos refactor "goal" --repos owner/repo1 owner/repo2');
+    process.exit(1);
+  }
+  const repos: string[] = [];
+  for (let i = reposIdx + 1; i < args.length; i++) {
+    if (args[i].startsWith("--")) break;
+    repos.push(args[i]);
+  }
+  if (repos.length < 2) {
+    console.error("Error: --repos requires at least 2 repos");
+    process.exit(1);
+  }
+
+  // Goal: everything before --repos / --lang / --no-pr / -v flags
+  const flagsAndValues = new Set<string>();
+  flagsAndValues.add("refactor");
+  flagsAndValues.add("-v");
+  flagsAndValues.add("--verbose");
+  flagsAndValues.add("--no-pr");
+  flagsAndValues.add("--repos");
+  flagsAndValues.add("--lang");
+  // Mark the flag values themselves
+  if (langIdx !== -1) flagsAndValues.add(args[langIdx + 1]);
+  repos.forEach((r) => flagsAndValues.add(r));
+
+  const goalArgs = args.filter((a) => !flagsAndValues.has(a));
+  const goal = goalArgs.join(" ").trim();
+
+  if (!goal) {
+    console.error("Error: please provide a refactor goal");
+    console.error('  arkos refactor "consolidate shared utils" --repos owner/repo1 owner/repo2');
+    process.exit(1);
+  }
+
+  runRefactor({ repos, goal, language, openPR: !noPR, verbose }).catch((err) => {
+    console.error("Arkos refactor error:", err);
     process.exit(1);
   });
 } else if (command === "serve") {

@@ -53,6 +53,9 @@ const WORKER_MODEL: Record<WorkerType, string> = {
   debugger: MODELS.coder,
   doc_writer: MODELS.light,
   file_ops: MODELS.light,
+  refactor_analyzer: MODELS.reviewer,
+  refactor_planner: MODELS.reviewer,
+  refactor_executor: MODELS.coder,
 };
 
 export interface AgentResult {
