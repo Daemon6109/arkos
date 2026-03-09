@@ -15,6 +15,33 @@ export interface RequirementSet {
   summary: string;          // one-line prompt injection string
 }
 
+// Known npm package names — never treat these as required files or commands
+const KNOWN_NPM_PACKAGES = new Set([
+  "discord.js", "react", "vue", "svelte", "express", "fastify", "hono",
+  "axios", "chalk", "ora", "commander", "yargs", "minimist", "dotenv",
+  "zod", "prisma", "drizzle", "typeorm", "mongoose", "sequelize",
+  "lodash", "date-fns", "dayjs", "moment", "uuid", "nanoid",
+  "bun", "node", "typescript", "tsx", "vite", "esbuild", "rollup",
+  "jest", "vitest", "mocha", "biome", "eslint", "prettier",
+  "inquirer", "kleur", "picocolors", "glob", "fast-glob", "fs-extra",
+  "p-limit", "execa", "cross-env", "rimraf", "concurrently",
+]);
+
+// Discord.js event names — these are events not commands
+const DISCORD_EVENTS = new Set([
+  "interactionCreate", "messageCreate", "guildCreate", "guildDelete",
+  "ready", "error", "warn", "debug", "shardReady", "voiceStateUpdate",
+  "channelCreate", "channelDelete", "memberAdd", "memberRemove",
+]);
+
+// Common words that look like slash commands but aren't
+const SLASH_FALSE_POSITIVES = new Set([
+  "commands", "index", "src", "lib", "dist", "test", "tests",
+  "config", "utils", "types", "models", "services", "handlers",
+  "middleware", "routes", "controllers", "schemas",
+  ...DISCORD_EVENTS,
+]);
+
 function langToExt(language: string): string {
   const map: Record<string, string> = {
     TypeScript: "ts", JavaScript: "js", Python: "py",
@@ -34,12 +61,16 @@ export function extractRequirements(goal: string, language: string): Requirement
     }
   }
 
-  // ── Slash commands: /word (but not URLs like http://) ─────────────────────
-  // Match /word but exclude :// patterns (URLs)
+  // ── Slash commands: /word (but not URLs or known false positives) ──────────
   const cmdPattern = /(?<!:)\/([a-zA-Z][a-zA-Z0-9_-]*)/g;
   let match: RegExpExecArray | null;
   while ((match = cmdPattern.exec(goal)) !== null) {
     const name = match[1];
+    // Skip known non-command patterns
+    if (SLASH_FALSE_POSITIVES.has(name) || KNOWN_NPM_PACKAGES.has(name)) continue;
+    // Skip if it looks like a file path segment (has a following /)
+    const afterMatch = goal.slice(match.index + match[0].length);
+    if (afterMatch.startsWith("/")) continue;
     add({
       id: `cmd:${name}`,
       type: "command",
@@ -49,15 +80,18 @@ export function extractRequirements(goal: string, language: string): Requirement
   }
 
   // ── Named files: src/foo.ts, index.ts, .env, README, etc. ────────────────
-  // Match paths with extension or well-known names
   const filePattern = /(?:src\/[\w/.-]+\.\w+|[\w.-]+\.(?:ts|js|py|rs|go|lua|json|env|md|yaml|yml|toml)|\.env(?:\.\w+)?|README(?:\.\w+)?)/gi;
   while ((match = filePattern.exec(goal)) !== null) {
     const filePath = match[0];
-    const label = filePath;
+    // Skip known npm package names masquerading as files
+    const baseName = filePath.split("/").pop()?.replace(/\.\w+$/, "") ?? "";
+    if (KNOWN_NPM_PACKAGES.has(filePath) || KNOWN_NPM_PACKAGES.has(baseName)) continue;
+    // Skip package.json, tsconfig.json, biome.json — assembly generates these
+    if (/^(package|tsconfig|biome|bun\.lock)/.test(baseName)) continue;
     add({
       id: `file:${filePath}`,
       type: "file",
-      label,
+      label: filePath,
       mustExist: true,
     });
   }
