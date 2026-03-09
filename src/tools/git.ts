@@ -75,3 +75,34 @@ export async function openPR(
 export async function getStagedDiff(repoDir: string): Promise<string> {
   return run(`git diff --cached`, repoDir);
 }
+
+/**
+ * Create a git stash, saving all current changes. Returns the stash ref output.
+ */
+export async function stashChanges(repoDir: string, message?: string): Promise<string> {
+  const msg = message ? ` -m ${JSON.stringify(message)}` : "";
+  return run(`git stash push${msg} --include-untracked`, repoDir);
+}
+
+/**
+ * Pop the most recent stash entry (rollback to saved state).
+ */
+export async function rollback(repoDir: string): Promise<void> {
+  await run(`git stash pop`, repoDir);
+}
+
+/**
+ * Hard reset to HEAD, discarding all uncommitted changes.
+ */
+export async function resetToHead(repoDir: string): Promise<void> {
+  await run(`git reset --hard HEAD`, repoDir);
+  // Also remove untracked files
+  await run(`git clean -fd`, repoDir);
+}
+
+/**
+ * Get a unified diff of all unstaged changes (working tree vs index).
+ */
+export async function getUnstagedDiff(repoDir: string): Promise<string> {
+  return run(`git diff`, repoDir);
+}

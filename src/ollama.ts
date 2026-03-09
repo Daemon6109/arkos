@@ -57,6 +57,142 @@ export async function generate(
   return data.response;
 }
 
+// ─── Tool Calling ─────────────────────────────────────────────────────────────
+
+export interface Tool {
+  name: string;
+  description: string;
+  parameters: {
+    type: "object";
+    properties: Record<string, { type: string; description: string }>;
+    required: string[];
+  };
+}
+
+export interface ToolCall {
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface ToolResult {
+  content: string;
+}
+
+interface ChatMessage {
+  role: "user" | "assistant" | "tool";
+  content: string;
+  tool_calls?: Array<{
+    function: { name: string; arguments: Record<string, unknown> };
+  }>;
+}
+
+interface ChatResponse {
+  message: {
+    role: string;
+    content: string;
+    tool_calls?: Array<{
+      function: { name: string; arguments: Record<string, unknown> };
+    }>;
+  };
+  prompt_eval_count?: number;
+  eval_count?: number;
+}
+
+export async function generateWithTools(
+  prompt: string,
+  tools: Tool[],
+  handlers: Record<string, (args: Record<string, unknown>) => Promise<string>>,
+  opts?: { model?: string; maxTurns?: number; phase?: string }
+): Promise<string> {
+  const model = opts?.model ?? DEFAULT_MODEL;
+  const maxTurns = opts?.maxTurns ?? 8;
+  const phase = opts?.phase ?? "unknown";
+
+  const messages: ChatMessage[] = [{ role: "user", content: prompt }];
+
+  let totalPromptTokens = 0;
+  let totalOutputTokens = 0;
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages,
+        tools: tools.map((t) => ({
+          type: "function",
+          function: {
+            name: t.name,
+            description: t.description,
+            parameters: t.parameters,
+          },
+        })),
+        stream: false,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Ollama chat error: ${res.status} ${await res.text()}`);
+    }
+
+    const data = (await res.json()) as ChatResponse;
+
+    totalPromptTokens += data.prompt_eval_count ?? 0;
+    totalOutputTokens += data.eval_count ?? 0;
+
+    const assistantMsg = data.message;
+
+    // No tool calls — final answer
+    if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
+      // Record cumulative tokens
+      try {
+        const { recordTokens } = await import("./optimizer/index.js");
+        recordTokens(phase, model, totalPromptTokens, totalOutputTokens);
+      } catch {}
+
+      return stripThinking(assistantMsg.content);
+    }
+
+    // Append assistant message with tool calls
+    messages.push({
+      role: "assistant",
+      content: assistantMsg.content ?? "",
+      tool_calls: assistantMsg.tool_calls,
+    });
+
+    // Execute each tool call and append results
+    for (const tc of assistantMsg.tool_calls) {
+      const fn = tc.function;
+      const handler = handlers[fn.name];
+      let result: string;
+      if (handler) {
+        try {
+          result = await handler(fn.arguments);
+        } catch (e) {
+          result = `Error: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      } else {
+        result = `Error: unknown tool "${fn.name}"`;
+      }
+
+      messages.push({
+        role: "tool",
+        content: result,
+      });
+    }
+  }
+
+  // Hit maxTurns without a final answer — return last content we have
+  try {
+    const { recordTokens } = await import("./optimizer/index.js");
+    recordTokens(phase, model, totalPromptTokens, totalOutputTokens);
+  } catch {}
+
+  const last = messages[messages.length - 1];
+  return stripThinking(last?.content ?? "");
+}
+
 export function stripThinking(text: string): string {
   // qwen3 wraps reasoning in <think>...</think> before the actual response
   return text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
