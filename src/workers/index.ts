@@ -255,17 +255,16 @@ export async function assembleProject(
     description: existingPkg.description ?? graph.goal,
     main: lang === "TypeScript" ? "dist/index.js" : "src/index.js",
     scripts: lang === "TypeScript"
-      ? { build: "tsc", start: "node dist/index.js", dev: "tsx src/index.ts", test: "jest" }
-      : { start: "node src/index.js", test: "jest" },
+      ? { build: "tsc", start: "bun src/index.ts", dev: "bun --watch src/index.ts", test: "bun test tests/", lint: "bunx biome check --apply src/", "type-check": "tsc --noEmit" }
+      : { start: "bun src/index.js", test: "bun test tests/", lint: "bunx biome check --apply src/" },
     dependencies: {
-      ...(existingPkg.dependencies ?? {}),
       ...(externalDeps.dependencies ?? {}),
+      ...(existingPkg.dependencies ?? {}),
     },
     devDependencies: {
       ...(lang === "TypeScript"
-        ? { typescript: "^5.4.0", tsx: "^4.7.0", "@types/node": "^20.0.0", jest: "^29.0.0", "ts-jest": "^29.0.0", "@types/jest": "^29.0.0" }
-        : { jest: "^29.0.0" }),
-      ...(existingPkg.devDependencies ?? {}),
+        ? { typescript: "^5.4.0", "@types/node": "^20.0.0", "@biomejs/biome": "^1.8.0" }
+        : { "@biomejs/biome": "^1.8.0" }),
       ...(externalDeps.devDependencies ?? {}),
     },
   };
@@ -290,6 +289,19 @@ export async function assembleProject(
       await writeFile(tsconfigPath, JSON.stringify(tsconfig, null, 2), "utf-8");
       console.log("    ✓ tsconfig.json");
     }
+  }
+
+  // ── biome.json ────────────────────────────────────────────────────────────
+  if (!existsSync(join(ctx.outputDir, "biome.json"))) {
+    const biome = {
+      $schema: "https://biomejs.dev/schemas/1.8.0/schema.json",
+      organizeImports: { enabled: true },
+      linter: { enabled: true, rules: { recommended: true } },
+      formatter: { enabled: true, indentStyle: "space", indentWidth: 2, lineWidth: 100 },
+      javascript: { formatter: { quoteStyle: "double", semicolons: "always" } },
+    };
+    await writeFile(join(ctx.outputDir, "biome.json"), JSON.stringify(biome, null, 2), "utf-8");
+    console.log("    ✓ biome.json");
   }
 
   // ── README ────────────────────────────────────────────────────────────────
@@ -498,11 +510,13 @@ function buildSystemPrompt(worker: WorkerType, lang: string): string {
 - Export exactly the symbols listed`;
 
     case "test_runner":
-      return `You are an expert ${lang} test engineer.
-- Write comprehensive tests: happy path, edge cases, error conditions
-- Use the standard test framework (Jest for TS/JS, pytest for Python)
-- Import the actual functions from the source files — don't reimplement them
-- Each test has a descriptive name`;
+      return `You are an expert ${lang} test engineer using Bun's test runner.
+- Import test utilities from "bun:test": import { describe, it, expect, beforeEach } from "bun:test"
+- Import the actual functions from the source files using relative paths — don't reimplement them
+- Write comprehensive tests: happy path, edge cases, and error conditions
+- Each test has a descriptive name that reads like a sentence
+- Use describe() blocks to group related tests
+- Tests must actually run — no placeholder or TODO tests`;
 
     case "debugger":
       return `You are an expert ${lang} debugger.

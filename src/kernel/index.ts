@@ -10,6 +10,7 @@ import { extractGoals } from "../goals/index.js";
 import { checkFeasibility } from "../feasibility/index.js";
 import { buildPlan, readyTasks } from "../planner/index.js";
 import { executeGraph, assembleProject } from "../workers/index.js";
+import { buildAndTest } from "../builder/index.js";
 import { evaluate, CONFIDENCE_THRESHOLD, MAX_RETRIES } from "../evaluator/index.js";
 import { storeRun } from "../memory/index.js";
 import { generate, stripThinking } from "../ollama.js";
@@ -103,8 +104,16 @@ export async function run(goal: string, opts: RunOptions = {}): Promise<void> {
   // ── Assembly pass — writes package.json, tsconfig, wires project ──────────
   await assembleProject(graph, ctx);
 
-  // ── 7. Evaluate ───────────────────────────────────────────────────────────
-  console.log("[7/7] 🔍  Evaluating output...");
+  // ── Build, lint, type-check, test (with auto-fix loop) ───────────────────
+  console.log("[7/8] 🔨  Build + lint + test...");
+  const buildResult = await buildAndTest(outputDir, language);
+  console.log(`  → ${buildResult.summary}`);
+  if (buildResult.errors.length > 0 && verbose) {
+    buildResult.errors.forEach(e => console.log(`    ⚠️  ${e.slice(0, 120)}`));
+  }
+
+  // ── 8. Evaluate ───────────────────────────────────────────────────────────
+  console.log("[8/8] 🔍  Evaluating output...");
   const evaluation = await evaluate(results, graph);
 
   const icon = evaluation.passed ? "✅" : "⚠️ ";
@@ -120,6 +129,9 @@ export async function run(goal: string, opts: RunOptions = {}): Promise<void> {
 
   // ── Memory ────────────────────────────────────────────────────────────────
   await storeRun(goal, vision, evaluation);
+
+  // ── Push output to arkos-runs repo ────────────────────────────────────────
+  await pushToRunsRepo(outputDir, goal, evaluation.overallScore);
 }
 
 // ─── Adaptive Retry ──────────────────────────────────────────────────────────
@@ -190,6 +202,22 @@ async function adaptiveRetry(
   }
 
   return currentResults;
+}
+
+async function pushToRunsRepo(outputDir: string, goal: string, score: number): Promise<void> {
+  try {
+    const { exec } = await import("child_process");
+    const { promisify } = await import("util");
+    const execAsync = promisify(exec);
+    const runsRepo = join(homedir(), ".arkos", "output");
+    await execAsync(
+      `git add -A && git commit -m "run: ${goal.slice(0, 60)} (score: ${score.toFixed(2)})" && git push`,
+      { cwd: runsRepo }
+    );
+    console.log("  📤 pushed to arkos-runs");
+  } catch {
+    // Non-fatal — don't break the run if git fails
+  }
 }
 
 function sanitizeName(name: string): string {
