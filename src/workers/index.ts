@@ -326,8 +326,8 @@ export async function assembleProject(
     },
     devDependencies: {
       ...(lang === "TypeScript"
-        ? { typescript: "^5.4.0", "@types/node": "^20.0.0", "@biomejs/biome": "^1.8.0" }
-        : { "@biomejs/biome": "^1.8.0" }),
+        ? { typescript: "^5.9.3", "@types/node": "^25.0.0", "@biomejs/biome": "^2.4.6" }
+        : { "@biomejs/biome": "^2.4.6" }),
       ...(externalDeps.devDependencies ?? {}),
     },
   };
@@ -357,7 +357,7 @@ export async function assembleProject(
   // ── biome.json ────────────────────────────────────────────────────────────
   if (!existsSync(join(ctx.outputDir, "biome.json"))) {
     const biome = {
-      $schema: "https://biomejs.dev/schemas/1.8.0/schema.json",
+      $schema: "https://biomejs.dev/schemas/2.4.6/schema.json",
       organizeImports: { enabled: true },
       linter: { enabled: true, rules: { recommended: true } },
       formatter: { enabled: true, indentStyle: "space", indentWidth: 2, lineWidth: 100 },
@@ -412,23 +412,27 @@ async function collectSourceFiles(outputDir: string): Promise<Map<string, string
 
 // Known npm package mappings: import name → { dep, devDep, types }
 const KNOWN_PACKAGES: Record<string, { dep?: string; version?: string; types?: string }> = {
-  "date-fns":    { dep: "date-fns", version: "^3.6.0" },
-  "yargs":       { dep: "yargs", version: "^17.7.2", types: "@types/yargs" },
-  "commander":   { dep: "commander", version: "^12.0.0" },
-  "chalk":       { dep: "chalk", version: "^5.3.0" },
-  "ora":         { dep: "ora", version: "^8.0.1" },
-  "axios":       { dep: "axios", version: "^1.7.0" },
-  "express":     { dep: "express", version: "^4.19.0", types: "@types/express" },
+  "date-fns":    { dep: "date-fns", version: "^4.1.0" },
+  "yargs":       { dep: "yargs", version: "^18.0.0", types: "@types/yargs" },
+  "commander":   { dep: "commander", version: "^14.0.3" },
+  "chalk":       { dep: "chalk", version: "^5.6.2" },
+  "ora":         { dep: "ora", version: "^9.3.0" },
+  "axios":       { dep: "axios", version: "^1.13.6" },
+  "express":     { dep: "express", version: "^5.1.0", types: "@types/express" },
   "lodash":      { dep: "lodash", version: "^4.17.21", types: "@types/lodash" },
-  "dotenv":      { dep: "dotenv", version: "^16.4.0" },
-  "zod":         { dep: "zod", version: "^3.23.0" },
-  "inquirer":    { dep: "inquirer", version: "^10.0.0", types: "@types/inquirer" },
-  "glob":        { dep: "glob", version: "^11.0.0" },
-  "fs-extra":    { dep: "fs-extra", version: "^11.2.0", types: "@types/fs-extra" },
+  "dotenv":      { dep: "dotenv", version: "^17.3.1" },
+  "zod":         { dep: "zod", version: "^4.3.6" },
+  "inquirer":    { dep: "inquirer", version: "^13.3.0" },
+  "glob":        { dep: "glob", version: "^13.0.6" },
+  "fs-extra":    { dep: "fs-extra", version: "^11.3.0", types: "@types/fs-extra" },
   "kleur":       { dep: "kleur", version: "^4.1.5" },
   "minimist":    { dep: "minimist", version: "^1.2.8", types: "@types/minimist" },
-  "table":       { dep: "table", version: "^6.8.2" },
+  "table":       { dep: "table", version: "^6.9.0" },
   "cli-table3":  { dep: "cli-table3", version: "^0.6.5", types: "@types/cli-table3" },
+  "p-limit":     { dep: "p-limit", version: "^6.2.0" },
+  "execa":       { dep: "execa", version: "^9.5.3" },
+  "fast-glob":   { dep: "fast-glob", version: "^3.3.3" },
+  "picocolors":  { dep: "picocolors", version: "^1.1.1" },
 };
 
 async function detectExternalDeps(
