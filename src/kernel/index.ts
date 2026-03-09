@@ -16,6 +16,7 @@ import { evaluate, CONFIDENCE_THRESHOLD, MAX_RETRIES } from "../evaluator/index.
 import { storeRun } from "../memory/index.js";
 import { ProjectMemory, getProjectContext } from "../memory/project.js";
 import { generate, stripThinking } from "../ollama.js";
+import { generateCriteria, runAcceptance } from "../acceptance/index.js";
 import type { TaskResult, TaskGraph } from "../types.js";
 import { join } from "path";
 import { homedir } from "os";

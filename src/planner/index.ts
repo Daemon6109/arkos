@@ -6,6 +6,7 @@
 import { generate, stripThinking, parseJsonSafe } from "../ollama.js";
 import type { VisionObject, Task, TaskGraph, TaskStatus, WorkerType, FileMapEntry } from "../types.js";
 import type { ExtractedGoal } from "../goals/index.js";
+import { extractRequirements } from "../requirements/index.js";
 import { randomUUID } from "crypto";
 
 export function readyTasks(graph: TaskGraph): Task[] {
@@ -25,8 +26,62 @@ export async function buildPlan(
   language: string = "TypeScript"
 ): Promise<TaskGraph> {
 
-  // ── Phase 1: Generate file map ─────────────────────────────────────────────
-  const fileMap = await generateFileMap(vision, language);
+  // ── Phase 1: Extract requirements from the raw vision ─────────────────────
+  const requirements = extractRequirements(vision.rawVision, language);
+  if (requirements.explicit.length > 0) {
+    console.log(`📋 Requirements: ${requirements.summary}`);
+  }
+
+  // ── Phase 1: Generate file map (with requirements injected) ───────────────
+  const fileMap = await generateFileMap(vision, language, requirements.summary);
+
+  // ── Phase 1b: Validate file map against explicit requirements ─────────────
+  for (const req of requirements.explicit) {
+    if (!req.mustExist) continue;
+
+    // Check if any file in the map matches this requirement
+    const matched = fileMap.some((f) => {
+      const pathLower = f.path.toLowerCase();
+      const descLower = f.description.toLowerCase();
+
+      if (req.type === "command") {
+        // /ping → look for ping in path or description
+        const cmdName = req.id.replace("cmd:", "");
+        return pathLower.includes(cmdName) || descLower.includes(`/${cmdName}`) || descLower.includes(cmdName);
+      }
+      if (req.type === "file") {
+        const fileName = req.id.replace("file:", "");
+        return pathLower.includes(fileName.toLowerCase()) || pathLower === fileName.toLowerCase();
+      }
+      if (req.type === "endpoint") {
+        return descLower.includes("endpoint") || descLower.includes("route") || descLower.includes("api");
+      }
+      return false;
+    });
+
+    if (!matched) {
+      // Add a stub file entry
+      let stubPath: string;
+      if (req.type === "command") {
+        const cmdName = req.id.replace("cmd:", "");
+        stubPath = `src/commands/${cmdName}.${langToExt(language)}`;
+      } else if (req.type === "file") {
+        stubPath = req.id.replace("file:", "");
+      } else if (req.type === "endpoint") {
+        stubPath = `src/routes/${req.id.replace("endpoint:", "").replace(/[/:]/g, "-").toLowerCase()}.${langToExt(language)}`;
+      } else {
+        stubPath = `src/${req.id.replace(/\w+:/, "")}.${langToExt(language)}`;
+      }
+
+      const stub: FileMapEntry = {
+        path: stubPath,
+        description: `${req.label} — required by project goal`,
+        exports: [],
+      };
+      fileMap.push(stub);
+      console.log(`  ⚠️  added missing required file: ${stubPath}`);
+    }
+  }
 
   // ── Phase 2: Tree search — generate 3 candidate task graphs and pick best ──
   const CANDIDATE_TEMPS = [0.3, 0.5, 0.7] as const;
@@ -83,9 +138,14 @@ function scorePlan(tasks: Task[], fileMap: FileMapEntry[]): number {
 
 async function generateFileMap(
   vision: VisionObject,
-  language: string
+  language: string,
+  requirementsSummary: string = ""
 ): Promise<FileMapEntry[]> {
   const ext = langToExt(language);
+
+  const requiredDeliverablesSection = requirementsSummary && requirementsSummary !== "No explicit requirements detected"
+    ? `\nREQUIRED DELIVERABLES (must appear as separate files in your plan):\n${requirementsSummary}\n\nEach requirement must map to at least one file in your output.\n`
+    : "";
 
   const prompt = `You are a software architect. Design the complete file structure for this project BEFORE any code is written.
 
@@ -93,7 +153,7 @@ Project: ${vision.name}
 Description: ${vision.description}
 Components: ${vision.components.join(", ")}
 Language: ${language}
-
+${requiredDeliverablesSection}
 Design the file structure. Every file should have a single clear responsibility.
 Include: source files, test files, config files (package.json, tsconfig.json if TS).
 
