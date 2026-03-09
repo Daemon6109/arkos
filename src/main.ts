@@ -5,6 +5,7 @@ import { run } from "./kernel/index.js";
 import { getStats } from "./memory/index.js";
 import { startServer } from "./server/index.js";
 import { runRefactor } from "./refactor/index.js";
+import { runFinalizeAnalyze } from "./finalize/index.js";
 
 const args = process.argv.slice(2);
 
@@ -18,6 +19,10 @@ Usage:
   arkos refactor "<goal>" --repos r1 r2     Cross-repo refactor analysis + PRs
   arkos refactor "<goal>" --repos r1 r2 --no-pr   Refactor without opening PRs
   arkos refactor "<goal>" --repos r1 r2 --lang TypeScript
+  arkos finalize analyze                    Multi-repo gap analyzer
+    --target <owner/repo>                   Repo to finalize
+    --reference <owner/repo>                Reference repo to compare against
+    --deps <owner/repo>...                  Dependency repos (space-separated)
   arkos serve                               Start HTTP API server (port 3847)
   arkos serve --port 8080                   Start on custom port
   arkos status                              Show memory stats
@@ -104,6 +109,41 @@ if (command === "run") {
     console.error("Arkos refactor error:", err);
     process.exit(1);
   });
+} else if (command === "finalize") {
+  const subcommand = args[1];
+  if (subcommand !== "analyze") {
+    console.error(`Unknown finalize subcommand: ${subcommand ?? "(none)"}`);
+    console.error("  arkos finalize analyze --target <owner/repo> [--reference <owner/repo>] [--deps <owner/repo>...]");
+    process.exit(1);
+  }
+
+  const targetIdx = args.indexOf("--target");
+  if (targetIdx === -1 || !args[targetIdx + 1]) {
+    console.error("Error: --target is required");
+    console.error("  arkos finalize analyze --target King-Studios-RBX/Anime-Reborn-Lobby");
+    process.exit(1);
+  }
+  const target = args[targetIdx + 1]!;
+
+  const refIdx = args.indexOf("--reference");
+  const reference = refIdx !== -1 ? args[refIdx + 1] : undefined;
+
+  // --deps: collect all values after --deps until next --flag
+  const depsIdx = args.indexOf("--deps");
+  const deps: string[] = [];
+  if (depsIdx !== -1) {
+    for (let i = depsIdx + 1; i < args.length; i++) {
+      if (args[i]!.startsWith("--")) break;
+      deps.push(args[i]!);
+    }
+  }
+
+  const verbose = args.includes("-v") || args.includes("--verbose");
+
+  runFinalizeAnalyze({ target, reference, deps, analyzeOnly: true, verbose }).catch((err) => {
+    console.error("Arkos finalize error:", err);
+    process.exit(1);
+  });
 } else if (command === "serve") {
   const portIdx = args.indexOf("--port");
   const port = portIdx !== -1 ? parseInt(args[portIdx + 1], 10) : 3847;
@@ -117,6 +157,6 @@ if (command === "run") {
   console.log(`  Avg score: ${stats.avgScore.toFixed(2)}`);
 } else {
   console.error(`Unknown command: ${command}`);
-  console.error("Commands: run, serve, status, help");
+  console.error("Commands: run, refactor, finalize, serve, status, help");
   process.exit(1);
 }
