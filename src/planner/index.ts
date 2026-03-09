@@ -133,7 +133,7 @@ Respond ONLY with JSON array:
   }
 ]`;
 
-  const raw = await generate(prompt, { model: "qwen3:14b", temperature: 0.3 });
+  const raw = await generate(prompt, { model: "qwen3:14b", temperature: 0.3 }, "planning");
   const cleaned = stripThinking(raw);
 
   const jsonStr = (() => {
@@ -198,7 +198,7 @@ Respond ONLY with JSON array:
   }
 ]`;
 
-  const raw = await generate(prompt, { model: "qwen3:14b", temperature });
+  const raw = await generate(prompt, { model: "qwen3:14b", temperature }, "planning");
   const cleaned = stripThinking(raw);
 
   const jsonStr = (() => {

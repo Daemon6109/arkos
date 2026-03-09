@@ -191,7 +191,7 @@ Fix ONLY what's broken. Don't rewrite files that don't have errors.`;
       model: "qwen2.5-coder:14b",
       temperature: 0.2,
       num_ctx: 12000,
-    });
+    }, "builder");
     const cleaned = stripThinking(raw);
 
     const jsonStr = (() => {

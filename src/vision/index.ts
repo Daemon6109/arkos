@@ -34,7 +34,7 @@ Respond ONLY with JSON (no explanation, no markdown):
   "successMetrics": ["metric1", "metric2"]
 }`;
 
-  const raw = await generate(prompt, { model: "qwen3:14b", temperature: 0.7 });
+  const raw = await generate(prompt, { model: "qwen3:14b", temperature: 0.7 }, "vision");
   const cleaned = stripThinking(raw);
 
   // Vision response is an object — extract {} block directly

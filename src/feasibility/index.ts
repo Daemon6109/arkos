@@ -57,7 +57,7 @@ Respond ONLY with JSON array:
   }
 ]`;
 
-  const raw = await generate(prompt, { model: "qwen3:8b", temperature: 0.3 });
+  const raw = await generate(prompt, { model: "qwen3:8b", temperature: 0.3 }, "feasibility");
   const cleaned = stripThinking(raw);
 
   // Feasibility returns a JSON array

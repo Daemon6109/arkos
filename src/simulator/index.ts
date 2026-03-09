@@ -130,7 +130,7 @@ Respond ONLY with valid JSON (no markdown, no explanation):
   "delights": ["specific moment where this user feels successful or impressed"]
 }`;
 
-  const raw = await generate(prompt, { model: "qwen3:8b", temperature: 0.85, num_ctx: 6000 });
+  const raw = await generate(prompt, { model: "qwen3:8b", temperature: 0.85, num_ctx: 6000 }, "simulation");
   const cleaned = stripThinking(raw);
 
   type RawSim = {

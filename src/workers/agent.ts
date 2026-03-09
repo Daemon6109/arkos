@@ -10,6 +10,7 @@
 
 import { generate, stripThinking } from "../ollama.js";
 import { Sandbox, formatToolResult, extractErrors } from "../sandbox/index.js";
+import { webSearch } from "../tools/search.js";
 import { writeFile, mkdir } from "fs/promises";
 import { join, dirname } from "path";
 import type { Task, WorkerType } from "../types.js";
@@ -83,7 +84,7 @@ Output a single \`\`\`${lang.toLowerCase()}\`\`\` code block.`;
       ? basePrompt
       : `${basePrompt}\n\n${conversationHistory}\n\nFix the issues above and output the corrected \`\`\`${lang.toLowerCase()}\`\`\` code block.`;
 
-    const raw = await generate(prompt, { model, temperature: 0.3, num_ctx: 12000 });
+    const raw = await generate(prompt, { model, temperature: 0.3, num_ctx: 12000 }, task.worker);
     const output = stripThinking(raw);
 
     // Extract and write code to sandbox
@@ -113,7 +114,23 @@ Output a single \`\`\`${lang.toLowerCase()}\`\`\` code block.`;
         } else {
           const errors = extractErrors(typeResult);
           console.log(`    ⚠️  type errors (turn ${turns}): ${errors.length} issues`);
-          conversationHistory += `\nTurn ${turns} type errors:\n${typeResult.stderr.slice(0, 800)}\n`;
+
+          // After turn 2, search for relevant package docs to help the model
+          let searchContext = "";
+          if (turns >= 2) {
+            const pkgName = extractPackageName(typeResult.stderr);
+            if (pkgName) {
+              const query = `${pkgName} TypeScript API latest`;
+              console.log(`    🔍 searched: ${query}`);
+              searchContext = await webSearch(query);
+            }
+          }
+
+          const errorSection = typeResult.stderr.slice(0, 800);
+          conversationHistory += `\nTurn ${turns} type errors:\n${errorSection}\n`;
+          if (searchContext) {
+            conversationHistory += `\nWeb search results for package docs:\n${searchContext}\n`;
+          }
           continue;
         }
       } else {
@@ -203,6 +220,27 @@ function langToExt(lang: string): string {
     Rust: "rs", Go: "go", Lua: "lua",
   };
   return map[lang] ?? "ts";
+}
+
+/**
+ * Try to extract a package/module name from a TypeScript error message.
+ * e.g. "Cannot find module 'yargs'" → "yargs"
+ *      "Module 'express' has no exported member" → "express"
+ */
+function extractPackageName(stderr: string): string | null {
+  // "Cannot find module 'X'" or "Could not find a declaration file for module 'X'"
+  const modMatch = stderr.match(/(?:Cannot find module|declaration file for module)\s+'([^'.@][^']+)'/);
+  if (modMatch) return modMatch[1].split("/")[0];
+
+  // "Module 'X' has no exported member"
+  const exportMatch = stderr.match(/Module '([^']+)' has no exported member/);
+  if (exportMatch) return exportMatch[1].split("/")[0];
+
+  // "from 'X'" in import statements referenced in errors
+  const importMatch = stderr.match(/from\s+'([^'.][^']+)'/);
+  if (importMatch) return importMatch[1].split("/")[0];
+
+  return null;
 }
 
 // Re-export writeFile convenience for callers
