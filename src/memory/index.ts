@@ -104,30 +104,36 @@ function saveStore(store: MemoryStore): void {
 
 function extractLessons(eval_: RunEvaluation, goal: string): string[] {
   const lessons: string[] = [];
+  const goalType = goal.split(" ").slice(0, 5).join(" ");
 
   for (const te of eval_.taskEvaluations) {
     if (te.overall < 0.5) {
-      lessons.push(
-        `Low score (${te.overall.toFixed(2)}) on "${te.notes}" — consider more context`
-      );
+      lessons.push(`Low score (${te.overall.toFixed(2)}) on task "${te.taskId}" for "${goalType}" — more context needed`);
+    }
+    if (te.overall >= 0.85) {
+      lessons.push(`High-quality task (${te.overall.toFixed(2)}) for "${goalType}" — approach worked well`);
     }
     if (te.action === "escalate") {
-      lessons.push(`Task escalated and could not be auto-resolved: ${te.taskId}`);
+      lessons.push(`Task escalated and could not be auto-resolved: ${te.taskId} (goal: "${goalType}")`);
     }
     if (te.action === "replan") {
-      lessons.push(`Task needed replanning — original plan was insufficient for goal type: ${goal}`);
+      lessons.push(`Task needed replanning — original plan insufficient for: "${goalType}"`);
+    }
+    if (te.action === "retry_with_context") {
+      lessons.push(`Task ${te.taskId} needed retry for "${goalType}" — consider expanded context upfront`);
     }
   }
 
   if (!eval_.passed) {
-    lessons.push(
-      `Run for "${goal}" did not pass threshold (score: ${eval_.overallScore.toFixed(2)})`
-    );
+    lessons.push(`Run for "${goalType}" did not pass threshold (${eval_.overallScore.toFixed(2)}) — review task complexity`);
   }
 
-  if (eval_.overallScore >= 0.9) {
-    lessons.push(`High-quality run (${eval_.overallScore.toFixed(2)}) for goal type: "${goal}"`);
-  }
+  // Always record a summary lesson for semantic retrieval
+  const taskCount = eval_.taskEvaluations.length;
+  const accepted = eval_.taskEvaluations.filter(t => t.action === "accept").length;
+  lessons.push(
+    `Goal type "${goalType}": ${taskCount} tasks, ${accepted} accepted, score ${eval_.overallScore.toFixed(2)}`
+  );
 
   return lessons;
 }

@@ -188,7 +188,7 @@ Output a single \`\`\`${lang.toLowerCase()}\`\`\` code block with the complete f
   console.log(`  → [${task.worker}] ${targetFile}`);
 
   // ── Generate ──────────────────────────────────────────────────────────────
-  const raw = await generate(prompt, { model, temperature: 0.3, num_ctx: 12000 });
+  const raw = await generate(prompt, { model, temperature: 0.3, num_ctx: 12000 }, task.worker);
   let output = stripThinking(raw);
 
   // ── Self-review (code_gen only) ───────────────────────────────────────────
@@ -267,7 +267,7 @@ Check:
 If it's correct (score 8+/10): respond exactly "LGTM"
 If it needs fixes: respond with ONLY the corrected \`\`\`${lang.toLowerCase()}\`\`\` code block.`;
 
-  const raw = await generate(prompt, { model: MODELS.reviewer, temperature: 0.1, num_ctx: 10000 });
+  const raw = await generate(prompt, { model: MODELS.reviewer, temperature: 0.1, num_ctx: 10000 }, "self_review");
   const critique = stripThinking(raw).trim();
 
   if (critique.startsWith("LGTM") || critique.length < 30) return output;
@@ -563,7 +563,7 @@ Your job:
 3. Do NOT change any existing exports or logic — only ADD the missing exports.
 4. Return ONLY the complete patched file in a single \`\`\`${lang.toLowerCase()}\`\`\` code block. No explanation.`;
 
-    const raw = await generate(patchPrompt, { model: "qwen2.5-coder:14b", temperature: 0.1, num_ctx: 8000 });
+    const raw = await generate(patchPrompt, { model: "qwen2.5-coder:14b", temperature: 0.1, num_ctx: 8000 }, "interface_fix");
     const patched = stripThinking(raw);
 
     // Extract code block
