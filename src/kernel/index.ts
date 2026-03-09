@@ -11,6 +11,7 @@ import { checkFeasibility } from "../feasibility/index.js";
 import { buildPlan, readyTasks } from "../planner/index.js";
 import { executeGraph, assembleProject } from "../workers/index.js";
 import { buildAndTest } from "../builder/index.js";
+import { getStats, resetStats, printEfficiencyReport, saveEfficiencyReport } from "../optimizer/index.js";
 import { evaluate, CONFIDENCE_THRESHOLD, MAX_RETRIES } from "../evaluator/index.js";
 import { storeRun } from "../memory/index.js";
 import { generate, stripThinking } from "../ollama.js";
@@ -31,6 +32,7 @@ export async function run(goal: string, opts: RunOptions = {}): Promise<void> {
   // Output directory for generated files
   const outputDir = opts.outputDir ?? join(homedir(), ".arkos", "output", sanitizeName(goal));
 
+  resetStats();
   console.log("\n🧠 Arkos — full pipeline");
   console.log(`Goal: ${goal}`);
   console.log(`Output: ${outputDir}\n`);
@@ -129,6 +131,11 @@ export async function run(goal: string, opts: RunOptions = {}): Promise<void> {
 
   // ── Memory ────────────────────────────────────────────────────────────────
   await storeRun(goal, vision, evaluation);
+
+  // ── Token efficiency report ───────────────────────────────────────────────
+  const tokenStats = getStats();
+  printEfficiencyReport(tokenStats);
+  await saveEfficiencyReport(tokenStats, outputDir);
 
   // ── Push output to arkos-runs repo ────────────────────────────────────────
   await pushToRunsRepo(outputDir, goal, evaluation.overallScore);

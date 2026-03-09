@@ -11,7 +11,11 @@ const DEFAULT_MODEL = "qwen3:14b";
 // Windows host Ollama (6900XT) — accessible from WSL2 via host gateway IP
 const OLLAMA_BASE = "http://172.30.176.1:11434";
 
-export async function generate(prompt: string, opts: OllamaOptions = {}): Promise<string> {
+export async function generate(
+  prompt: string,
+  opts: OllamaOptions = {},
+  phase = "unknown"
+): Promise<string> {
   const model = opts.model ?? DEFAULT_MODEL;
 
   const res = await fetch(`${OLLAMA_BASE}/api/generate`, {
@@ -32,7 +36,22 @@ export async function generate(prompt: string, opts: OllamaOptions = {}): Promis
     throw new Error(`Ollama error: ${res.status} ${await res.text()}`);
   }
 
-  const data = (await res.json()) as { response: string };
+  const data = (await res.json()) as {
+    response: string;
+    prompt_eval_count?: number;
+    eval_count?: number;
+  };
+
+  // Track tokens — Ollama returns exact counts
+  const promptTokens = data.prompt_eval_count ?? Math.ceil(prompt.length / 4);
+  const outputTokens = data.eval_count ?? Math.ceil((data.response?.length ?? 0) / 4);
+
+  // Lazy import to avoid circular dependency
+  try {
+    const { recordTokens } = await import("./optimizer/index.js");
+    recordTokens(phase, model, promptTokens, outputTokens);
+  } catch {}
+
   return data.response;
 }
 

@@ -13,6 +13,7 @@ export interface ExecutionContext {
   outputDir: string;
   projectName: string;
   language: string;
+  priorContext?: string;
 }
 
 // ─── Model assignments ────────────────────────────────────────────────────────
@@ -48,16 +49,19 @@ export async function executeGraph(
   );
 
   const results: TaskResult[] = [];
+  const builtContext: string[] = []; // carry-forward context, compressed as needed
 
   while (true) {
     const ready = readyTasks(graph);
     if (ready.length === 0) break;
 
+    const contextSnapshot = builtContext.join("\n\n");
+
     const batchResults = await Promise.all(
       ready.map(async (task) => {
         task.status = "running";
         try {
-          const result = await executeTask(task, graph, ctx);
+          const result = await executeTask(task, graph, { ...ctx, priorContext: contextSnapshot });
           task.status = "complete";
           return result;
         } catch (err) {
@@ -72,6 +76,29 @@ export async function executeGraph(
         }
       })
     );
+
+    // Accumulate context from completed tasks
+    for (const r of batchResults) {
+      if (r.confidence > 0.5 && r.output.length > 100) {
+        const task = graph.tasks.find(t => t.id === r.taskId);
+        builtContext.push(`[${task?.targetFile ?? r.worker}]\n${r.output.slice(0, 800)}`);
+      }
+    }
+
+    // Compress context if growing large
+    const fullContext = builtContext.join("\n\n");
+    if (fullContext.length > 2500 && readyTasks(graph).length > 0) {
+      try {
+        const { compressContext } = await import("../optimizer/index.js");
+        const nextTask = readyTasks(graph)[0];
+        const result = await compressContext(fullContext, nextTask?.description ?? "next task");
+        if (result.compressed) {
+          builtContext.length = 0;
+          builtContext.push(result.context);
+          console.log(`    ⚡ context ${result.originalLength}→${result.compressedLength} chars (~${result.tokensSaved} tokens saved, ${(result.similarityScore * 100).toFixed(0)}% similarity)`);
+        }
+      } catch {}
+    }
 
     results.push(...batchResults);
   }
@@ -98,6 +125,10 @@ async function executeTask(
     .map(f => `  ${f.path} — ${f.description} [exports: ${f.exports.join(", ") || "none"}]`)
     .join("\n");
 
+  const priorSection = ctx.priorContext && ctx.priorContext.length > 50
+    ? `\n--- PRIOR TASK OUTPUTS (for consistency) ---\n${ctx.priorContext.slice(0, 1200)}\n---\n`
+    : "";
+
   const existingSection = existingCode.length > 0
     ? `\n--- EXISTING PROJECT FILES (import from these, do NOT redefine) ---\n${existingCode}\n---\n`
     : "";
@@ -117,7 +148,7 @@ ${fileMapSummary}
 YOUR TASK: ${task.description}
 YOUR OUTPUT FILE: ${targetFile}
 ${task.exports && task.exports.length > 0 ? `YOU MUST EXPORT: ${task.exports.join(", ")}` : ""}
-${existingSection}${retrySection}
+${priorSection}${existingSection}${retrySection}
 Write ONLY the content for ${targetFile}.
 Do NOT redefine things already implemented in existing files — import them instead.
 Output a single \`\`\`${lang.toLowerCase()}\`\`\` code block with the complete file content.`;
