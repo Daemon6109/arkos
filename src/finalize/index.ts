@@ -102,18 +102,60 @@ async function buildAllRepoData(cloned: ClonedRepo): Promise<RepoData> {
 
 // ─── Step 3: Import Cleanup + Type Cleanup ────────────────────────────────────
 
+/**
+ * Score a dep file path — higher = better match for a utility function.
+ * Returns -1 for paths that should be excluded (interface/assets packages).
+ */
+function scoreDepMatch(relPath: string): number {
+  const lp = relPath.toLowerCase();
+  if (lp.includes("packages/utils/")) return 10;
+  if (lp.includes("packages/types/")) return 9;
+  if (lp.includes("packages/shared/")) return 8;
+  // Exclude interface/asset packages — these are not utility sources
+  if (lp.includes("packages/interface/") || lp.includes("packages/assets/")) return -1;
+  return 1;
+}
+
+/**
+ * Resolve the real npm package name for a file inside a dep repo.
+ * Walks packages/<folder>/package.json when it's a monorepo sub-package.
+ */
+async function findDepPackageForFile(
+  depData: RepoData,
+  relPath: string
+): Promise<string | null> {
+  const match = relPath.match(/^packages\/([^/]+)\//);
+  if (match) {
+    const pkgFolder = match[1]!;
+    try {
+      const pkgJsonPath = join(depData.localDir, "packages", pkgFolder, "package.json");
+      const content = await readFile(pkgJsonPath, "utf-8");
+      const pkg = JSON.parse(content) as { name?: string };
+      if (pkg.name) return pkg.name;
+    } catch {
+      // Fall back to derived name
+    }
+    const owner = (depData.ownerRepo.split("/")[0] ?? "").toLowerCase().replace(/_/g, "-");
+    return `@${owner}/${pkgFolder.toLowerCase().replace(/_/g, "-")}`;
+  }
+  // Top-level file — use the repo package name
+  return pkgNameFromRepo(depData.ownerRepo);
+}
+
 async function detectImportCleanup(
   targetData: RepoData,
   depDataList: RepoData[]
 ): Promise<TodoItem[]> {
   const todos: TodoItem[] = [];
 
-  // Build map of dep basenames → dep info
-  const depFileIndex = new Map<string, { depData: RepoData; relPath: string }>();
+  // Build multi-map: basename → all dep file matches (to check ALL deps, not just first)
+  const depFileIndex = new Map<string, Array<{ depData: RepoData; relPath: string }>>();
   for (const depData of depDataList) {
     for (const f of depData.map.files) {
-      const b = basename(f.path, extname(f.path));
-      depFileIndex.set(b.toLowerCase(), { depData, relPath: f.path });
+      const b = basename(f.path, extname(f.path)).toLowerCase();
+      const existing = depFileIndex.get(b) ?? [];
+      existing.push({ depData, relPath: f.path });
+      depFileIndex.set(b, existing);
     }
   }
 
@@ -124,21 +166,31 @@ async function detectImportCleanup(
 
   for (const uf of utilFiles) {
     const b = basename(uf.path, extname(uf.path)).toLowerCase();
-    const match = depFileIndex.get(b);
-    if (match) {
-      const pkgName = pkgNameFromRepo(match.depData.ownerRepo);
-      todos.push({
-        id: makeId("import_cleanup", b),
-        type: "import_cleanup",
-        priority: "medium",
-        title: `Remove local copy of ${b} utility`,
-        description: `${uf.path} duplicates ${match.relPath} already provided by ${pkgName}. Remove the local copy and import from the package instead.`,
-        targetFile: uf.path,
-        referenceFile: match.relPath,
-        suggestedChange: `Delete ${uf.path} and replace all imports with \`import { ... } from "${pkgName}"\``,
-        estimatedComplexity: "simple",
-      });
-    }
+    const allMatches = depFileIndex.get(b) ?? [];
+
+    // Score all matches and filter out bad ones (interface/assets packages)
+    const goodMatches = allMatches
+      .map((m) => ({ ...m, score: scoreDepMatch(m.relPath) }))
+      .filter((m) => m.score > 0)
+      .sort((a, c) => c.score - a.score);
+
+    if (goodMatches.length === 0) continue; // no clear match — skip to avoid bad suggestions
+
+    const best = goodMatches[0]!;
+    const pkgName = await findDepPackageForFile(best.depData, best.relPath);
+    if (!pkgName) continue;
+
+    todos.push({
+      id: makeId("import_cleanup", b),
+      type: "import_cleanup",
+      priority: "medium",
+      title: `Remove local copy of ${b} utility`,
+      description: `${uf.path} duplicates ${best.relPath} already provided by ${pkgName}. Remove the local copy and import from the package instead.`,
+      targetFile: uf.path,
+      referenceFile: best.relPath,
+      suggestedChange: `Delete ${uf.path} and replace all imports with \`import { ... } from "${pkgName}"\``,
+      estimatedComplexity: "simple",
+    });
   }
 
   // Check target/src/shared/types/ for type cleanup
@@ -206,20 +258,64 @@ async function detectServiceGaps(
 ): Promise<TodoItem[]> {
   const todos: TodoItem[] = [];
 
-  const refServices = extractServiceNames(referenceData);
+  // Filter reference files to only relevant service/controller paths.
+  // Exclude: place-specific code, tests, store templates, and deep UI prop components.
+  const relevantRefFiles = referenceData.map.files.filter((f) => {
+    const p = f.path;
+    // Exclude all place-specific code (places/gameplay/, places/lobby/, etc.)
+    if (p.startsWith("places/")) return false;
+    // Exclude test files
+    if (p.endsWith(".spec.ts") || p.endsWith(".test.ts") || p.includes("__tests__/")) return false;
+    // Exclude data store schema templates
+    if (p.includes("src/server/services/store/")) return false;
+    // Only keep top-level service and controller files
+    // (not deep interface prop components like src/client/controllers/interface/props/)
+    const isService = p.startsWith("src/server/services/") || p.startsWith("src/client/controllers/");
+    if (!isService) return false;
+    return true;
+  });
+
+  // Build filtered reference service map
+  const refServices = new Map<string, string>();
+  for (const f of relevantRefFiles) {
+    const lower = f.path.toLowerCase();
+    if (
+      lower.includes("service") ||
+      lower.includes("controller") ||
+      lower.includes("manager")
+    ) {
+      const b = basename(f.path, extname(f.path)).toLowerCase();
+      refServices.set(b, f.path);
+    }
+  }
+
   const targetServices = extractServiceNames(targetData);
 
   // service_missing: in reference but not target
   for (const [name, refPath] of refServices) {
     if (!targetServices.has(name)) {
+      // Interface controllers may already be handled by the interface package
+      const isInterfaceController =
+        refPath.includes("src/client/controllers/interface/") ||
+        refPath.includes("src/client/controllers/ui/") ||
+        /\/(hide_hud|store|hotbar|summon|hud)/.test(refPath);
+
+      const description = isInterfaceController
+        ? `${refPath} exists in the reference repo but has no counterpart in the target. May already be handled by @king-studios-rbx/anime-reborn-interface package — verify before implementing.`
+        : `${refPath} exists in the reference repo but has no counterpart in the target. This service needs to be created or ported.`;
+
+      const suggestedChange = isInterfaceController
+        ? `Verify whether @king-studios-rbx/anime-reborn-interface already covers this, then port or create a counterpart to ${refPath} if needed`
+        : `Port or create a counterpart to ${refPath} in the target repo`;
+
       todos.push({
         id: makeId("service_missing", name),
         type: "service_missing",
-        priority: "high",
+        priority: "medium", // lowered from high — many reference items are false positives
         title: `Missing service/controller: ${name}`,
-        description: `${refPath} exists in the reference repo but has no counterpart in the target. This service needs to be created or ported.`,
+        description,
         referenceFile: refPath,
-        suggestedChange: `Port or create a counterpart to ${refPath} in the target repo`,
+        suggestedChange,
         estimatedComplexity: "moderate",
       });
     }
@@ -328,15 +424,30 @@ async function detectNetworkingIssues(targetData: RepoData): Promise<TodoItem[]>
 
 // ─── Step 6: Unused Dependencies ─────────────────────────────────────────────
 
+/** Returns true for packages that should never be flagged as unused. */
+function isNonImportedDep(pkgName: string): boolean {
+  // TypeScript transformers — build tools, never imported in source
+  if (/^rbxts-transform(er)?/.test(pkgName)) return true;
+  // Compiler tools
+  if (pkgName === "roblox-ts" || pkgName === "typescript" || pkgName === "rbxtsc") return true;
+  // Ambient type packages — provide .d.ts globals, no import needed
+  if (pkgName === "@rbxts/compiler-types" || pkgName === "@rbxts/types") return true;
+  if (pkgName === "@king-studios-rbx/types") return true;
+  if (pkgName.startsWith("@types/")) return true;
+  // Generic tooling
+  if (pkgName === "bun" || pkgName === "prettier" || pkgName === "eslint") return true;
+  return false;
+}
+
 async function detectUnusedDeps(targetData: RepoData): Promise<TodoItem[]> {
   const todos: TodoItem[] = [];
 
   const pkgJson = targetData.structure.packageJson;
   if (!pkgJson) return todos;
 
-  const deps: Record<string, string> = {
+  // Only check runtime dependencies — skip ALL devDependencies (they're tooling)
+  const runtimeDeps: Record<string, string> = {
     ...((pkgJson.dependencies as Record<string, string>) ?? {}),
-    ...((pkgJson.devDependencies as Record<string, string>) ?? {}),
     ...((pkgJson.peerDependencies as Record<string, string>) ?? {}),
   };
 
@@ -354,28 +465,15 @@ async function detectUnusedDeps(targetData: RepoData): Promise<TodoItem[]> {
     }
   }
 
-  // Skip common non-imported deps (build tools, type-only packages, etc.)
-  const skipPkgs = new Set([
-    "typescript",
-    "rbxtsc",
-    "@rbxts/compiler-types",
-    "@rbxts/types",
-    "bun",
-    "prettier",
-    "eslint",
-    "@types/node",
-    "roblox-ts",
-  ]);
-
-  for (const pkgName of Object.keys(deps)) {
-    if (skipPkgs.has(pkgName)) continue;
+  for (const pkgName of Object.keys(runtimeDeps)) {
+    if (isNonImportedDep(pkgName)) continue;
     if (!allImports.has(pkgName)) {
       todos.push({
         id: makeId("dependency_unused", pkgName),
         type: "dependency_unused",
         priority: "low",
         title: `Unused dependency: ${pkgName}`,
-        description: `"${pkgName}" is listed in package.json but no file in src/ imports from it. Either remove it or start using it.`,
+        description: `"${pkgName}" is listed in dependencies but no file in src/ imports from it. Either remove it or start using it.`,
         suggestedChange: `Run \`npm uninstall ${pkgName}\` if it is not needed`,
         estimatedComplexity: "trivial",
       });
