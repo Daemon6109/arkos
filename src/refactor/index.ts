@@ -13,6 +13,19 @@ import {
 import { buildRepoMap, formatRepoMap, type RepoMap } from "../tools/repo_map.js";
 import { generate, parseJsonSafe } from "../ollama.js";
 import { join } from "path";
+import { storeRefactorLesson, getRefactorLessons } from "../memory/index.js";
+
+// Lazy-load tsc_checker so it degrades gracefully if not present
+import type { TscResult } from "../tools/tsc_checker.js";
+let runTsc: ((repoDir: string) => Promise<TscResult>) | null = null;
+(async () => {
+  try {
+    const mod = await import("../tools/tsc_checker.js") as { runTsc: (repoDir: string) => Promise<TscResult> };
+    runTsc = mod.runTsc;
+  } catch {
+    // tsc_checker not yet available — speculative execution will degrade gracefully
+  }
+})();
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -143,7 +156,8 @@ async function buildRefactorPlan(
   goal: string,
   language: string,
   shortNameMap: Map<string, string>,
-  clonedDirs: Map<string, string>
+  clonedDirs: Map<string, string>,
+  priorLessons: string[] = []
 ): Promise<RefactorPlan> {
   const fallback: RefactorPlan = {
     filesToMove: [],
@@ -173,10 +187,14 @@ async function buildRefactorPlan(
   // Target repo structure (the last repo is the "common" target by convention)
   const targetStructure = structures[structures.length - 1];
 
+  const lessonsSection = priorLessons.length > 0
+    ? `PRIOR LESSONS FROM THIS REPO:\n${priorLessons.map((l, i) => `${i + 1}. ${l}`).join("\n")}\n\n`
+    : "";
+
   const prompt = `You are a senior ${language} architect.
 GOAL: ${goal}
 
-CANDIDATE FILES (contents — decide what to move):
+${lessonsSection}CANDIDATE FILES (contents — decide what to move):
 ${fileContentParts.join("\n\n")}
 
 TARGET REPO STRUCTURE (${targetStructure.ownerRepo}):
@@ -235,10 +253,12 @@ async function verifyModifiedFiles(
   modifiedFiles: Array<{ repoDir: string; path: string; repoName: string }>,
   goal: string,
   language: string
-): Promise<void> {
-  if (modifiedFiles.length === 0) return;
+): Promise<string[]> {
+  if (modifiedFiles.length === 0) return [];
 
   log("\n🔎 Verification: checking modified files...");
+
+  const issues: string[] = [];
 
   for (const { repoDir, path, repoName } of modifiedFiles) {
     const content = await readRepoFile(repoDir, path);
@@ -266,10 +286,13 @@ Reply with a brief assessment. If there are issues, start your reply with "ISSUE
     const stripped = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
     if (stripped.startsWith("ISSUE:")) {
       log(`  ⚠️  ${repoName}/${path}: ${stripped}`);
+      issues.push(`${repoName}/${path}: ${stripped.slice("ISSUE:".length).trim()}`);
     } else {
       log(`  ✅ ${repoName}/${path}: ${stripped.slice(0, 100)}`);
     }
   }
+
+  return issues;
 }
 
 // ─── Pipeline ─────────────────────────────────────────────────────────────────

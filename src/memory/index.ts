@@ -243,6 +243,93 @@ export async function getRecentLessons(limit = 10, query?: string): Promise<stri
     .slice(-limit);
 }
 
+// ─── Refactor Memory ─────────────────────────────────────────────────────────
+
+interface RefactorLesson {
+  repo: string;        // e.g. "King-Studios-RBX/Anime-Reborn-Lobby"
+  lesson: string;      // e.g. "safePlayerAdded is a default export, not named"
+  timestamp: number;
+  embedding?: number[];
+}
+
+interface RefactorMemoryStore {
+  lessons: RefactorLesson[];
+}
+
+function refactorMemoryPath(): string {
+  return join(memoryDir(), "refactor-memory.json");
+}
+
+function loadRefactorStore(): RefactorMemoryStore {
+  const path = refactorMemoryPath();
+  if (!existsSync(path)) return { lessons: [] };
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<RefactorMemoryStore>;
+    return { lessons: raw.lessons ?? [] };
+  } catch {
+    return { lessons: [] };
+  }
+}
+
+function saveRefactorStore(store: RefactorMemoryStore): void {
+  mkdirSync(memoryDir(), { recursive: true });
+  writeFileSync(refactorMemoryPath(), JSON.stringify(store, null, 2), "utf-8");
+}
+
+/**
+ * Store a lesson learned during a refactor run for a specific repo.
+ * Embeds the lesson for later semantic retrieval.
+ */
+export async function storeRefactorLesson(repo: string, lesson: string): Promise<void> {
+  const store = loadRefactorStore();
+  const embedding = await embedText(lesson);
+  store.lessons.push({ repo, lesson, timestamp: Date.now(), embedding });
+  // Cap at 1000 lessons
+  store.lessons = store.lessons.slice(-1000);
+  saveRefactorStore(store);
+  console.log(`💾 Refactor lesson stored for ${repo}: ${lesson.slice(0, 80)}...`);
+}
+
+/**
+ * Get relevant lessons for a given repo and goal.
+ * Filters by repo name first, then ranks by semantic similarity to goal.
+ * Falls back to recency if embeddings are unavailable.
+ */
+export async function getRefactorLessons(
+  repo: string,
+  goal: string,
+  limit = 10
+): Promise<string[]> {
+  const store = loadRefactorStore();
+
+  // Filter to lessons matching this repo (exact or partial match)
+  const repoLessons = store.lessons.filter(
+    (l) => l.repo === repo || l.repo.includes(repo) || repo.includes(l.repo)
+  );
+
+  if (repoLessons.length === 0) return [];
+
+  const queryEmbedding = await embedText(goal);
+
+  if (queryEmbedding.length === 0) {
+    // Fall back to recency
+    return repoLessons.slice(-limit).map((l) => l.lesson);
+  }
+
+  // Score by cosine similarity
+  const scored = repoLessons.map((l) => ({
+    lesson: l.lesson,
+    score: l.embedding && l.embedding.length > 0
+      ? cosineSimilarity(queryEmbedding, l.embedding)
+      : 0,
+  }));
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map((l) => l.lesson);
+}
+
+// ─── General Stats ────────────────────────────────────────────────────────────
+
 export function getStats(): { total: number; passed: number; avgScore: number } {
   const store = loadStore();
   const records = store.records;
