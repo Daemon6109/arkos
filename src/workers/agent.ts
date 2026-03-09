@@ -11,9 +11,34 @@
 import { generate, stripThinking } from "../ollama.js";
 import { Sandbox, formatToolResult, extractErrors } from "../sandbox/index.js";
 import { webSearch } from "../tools/search.js";
+import { getLibraryDocs } from "../tools/context7.js";
 import { writeFile, mkdir } from "fs/promises";
 import { join, dirname } from "path";
 import type { Task, WorkerType } from "../types.js";
+
+// Packages we know about — used for detection in task descriptions
+const KNOWN_PACKAGE_NAMES = [
+  "date-fns", "yargs", "commander", "chalk", "ora", "axios", "express",
+  "lodash", "dotenv", "zod", "inquirer", "glob", "fs-extra", "kleur",
+  "minimist", "table", "cli-table3", "p-limit", "execa", "fast-glob",
+  "picocolors", "discord.js", "discord", "socket.io", "ws", "mongoose",
+  "prisma", "drizzle", "knex", "sequelize", "react", "vue", "svelte",
+  "vite", "webpack", "esbuild", "rollup", "jest", "vitest", "mocha",
+];
+
+/** Detect which known packages a task likely needs based on its description and target file. */
+function detectPackages(description: string, targetFile?: string): string[] {
+  const haystack = `${description} ${targetFile ?? ""}`.toLowerCase();
+  return KNOWN_PACKAGE_NAMES.filter(pkg => haystack.includes(pkg.toLowerCase()));
+}
+
+/** Extract first meaningful word from a description to use as topic. */
+function extractTopic(description: string): string | undefined {
+  const word = description.trim().split(/\s+/)[0]?.toLowerCase();
+  // Skip common filler words
+  const skip = new Set(["create", "write", "implement", "build", "add", "make", "generate", "the", "a", "an"]);
+  return word && !skip.has(word) ? word : undefined;
+}
 
 const MAX_AGENT_TURNS = 4;
 const MODELS = {
@@ -56,6 +81,26 @@ export async function runAgenticWorker(
   // ── System prompt ─────────────────────────────────────────────────────────
   const systemPrompt = buildSystemPrompt(task.worker, lang);
 
+  // ── Fetch live package docs (code_gen and debugger only) ─────────────────
+  let packageDocsSection = "";
+  if (task.worker === "code_gen" || task.worker === "debugger") {
+    const detected = detectPackages(task.description, task.targetFile);
+    if (detected.length > 0) {
+      const topic = extractTopic(task.description);
+      const docParts: string[] = [];
+      for (const pkg of detected) {
+        const docs = await getLibraryDocs(pkg, topic);
+        if (docs) {
+          console.log(`    📚 fetched docs: ${pkg}`);
+          docParts.push(docs);
+        }
+      }
+      if (docParts.length > 0) {
+        packageDocsSection = `\nPACKAGE DOCS:\n${docParts.join("\n\n")}\n`;
+      }
+    }
+  }
+
   // ── Initial context ───────────────────────────────────────────────────────
   const priorSection = priorContext.length > 50
     ? `\nPRIOR TASK OUTPUTS:\n${priorContext.slice(0, 1000)}\n`
@@ -72,7 +117,7 @@ FILE MAP:\n${fileMapSummary}
 YOUR FILE: ${targetFile}
 ${task.exports?.length ? `MUST EXPORT: ${task.exports.join(", ")}` : ""}
 TASK: ${task.description}
-${priorSection}${existingSection}
+${priorSection}${existingSection}${packageDocsSection}
 Write the complete content of ${targetFile}.
 Output a single \`\`\`${lang.toLowerCase()}\`\`\` code block.`;
 

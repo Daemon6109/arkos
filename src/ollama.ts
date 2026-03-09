@@ -5,6 +5,7 @@ export interface OllamaOptions {
   model?: string;
   temperature?: number;
   num_ctx?: number;
+  num_predict?: number;
 }
 
 const DEFAULT_MODEL = "qwen3:14b";
@@ -27,7 +28,8 @@ export async function generate(
       stream: false,
       options: {
         temperature: opts.temperature ?? 0.7,
-        num_ctx: opts.num_ctx ?? 4096,
+        num_ctx: opts.num_ctx ?? 16384,
+        num_predict: opts.num_predict ?? 8192,
       },
     }),
   });

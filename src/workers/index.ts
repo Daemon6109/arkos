@@ -692,12 +692,21 @@ function buildSystemPrompt(worker: WorkerType, lang: string): string {
 
 function extractCodeBlocks(text: string): Array<{ lang: string; code: string }> {
   const blocks: Array<{ lang: string; code: string }> = [];
-  const regex = /```([a-zA-Z0-9]*)\n([\s\S]*?)```/g;
+  // Try closed blocks first (non-greedy)
+  const closedRegex = /```([a-zA-Z0-9]*)\n([\s\S]*?)```/g;
   let match;
-  while ((match = regex.exec(text)) !== null) {
+  while ((match = closedRegex.exec(text)) !== null) {
     if (match[2].trim().length > 10) {
       blocks.push({ lang: match[1] || "txt", code: match[2].trim() });
     }
+  }
+  if (blocks.length > 0) return blocks;
+
+  // Fallback: model output was truncated before closing ```, grab everything after opening fence
+  const openRegex = /```([a-zA-Z0-9]*)\n([\s\S]+)$/;
+  const openMatch = text.match(openRegex);
+  if (openMatch && openMatch[2].trim().length > 10) {
+    blocks.push({ lang: openMatch[1] || "txt", code: openMatch[2].trim() });
   }
   return blocks;
 }
