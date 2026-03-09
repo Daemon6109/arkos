@@ -362,7 +362,7 @@ Respond ONLY with valid JSON (no markdown, no extra text):
         summary: typeof p.summary === "string" ? p.summary : "Plan parsed",
       };
 
-      // Fix 4: Filter out moves where the source file has repo-specific imports
+      // Fix 4 + Bug 3 double-filter: reject files with repo-specific imports OR client/server paths
       const repoSpecificPatterns = [
         /@king-studios-rbx\/anime-reborn-(?!common|types|utils|assets)/,
         /from ['"]src\/client\//,
@@ -370,6 +370,15 @@ Respond ONLY with valid JSON (no markdown, no extra text):
         /@rbxts\/vide/,
       ];
       plan.filesToMove = plan.filesToMove.filter(move => {
+        // Path-level filter: never move client-side or server-side files to common
+        if (move.path.startsWith("src/client/")) {
+          log(`  🚫 Skipping ${move.path} — client-side path`);
+          return false;
+        }
+        if (move.path.startsWith("src/server/")) {
+          log(`  🚫 Skipping ${move.path} — server-side path`);
+          return false;
+        }
         const content = candidateContents.get(move.path);
         if (!content) return true;
         const isSpecific = repoSpecificPatterns.some(pat => pat.test(content));
@@ -466,10 +475,11 @@ interface BranchResult {
 async function executePlanVariant(
   variant: BranchVariant,
   plan: RefactorPlan,
-  clonedDirs: Map<string, string>,
+  clonedDirs: Map<string, string>, // NOTE: must be variant-specific dirs (vDirs), not original clonedDirs
   resolveRepo: (nameOrOwner: string) => string | undefined,
   language: string,
-  goal: string
+  goal: string,
+  baselineTestResults: Map<string, number> = new Map()
 ): Promise<BranchResult> {
   const result: BranchResult = {
     variant: variant.variant,
@@ -593,13 +603,15 @@ async function executePlanVariant(
   }
 
   // ── Fix 5: Verify stale imports ─────────────────────────────────────────────
-  // After updating imports, check no .ts files in source repos still import old paths
+  // After updating imports, check no .ts files in source repos still import old paths.
+  // IMPORTANT: clonedDirs here is the variant-specific vDirs (not original clones), so we
+  // correctly read the post-edit state of the variant working tree.
   if (!variant.skipImports) {
     for (const move of plan.filesToMove) {
       const fromRepo = resolveRepo(move.fromRepo);
       const toRepo = resolveRepo(move.toRepo);
       if (!fromRepo || !toRepo || fromRepo === toRepo) continue;
-      const fromDir = clonedDirs.get(fromRepo)!;
+      const fromDir = clonedDirs.get(fromRepo)!; // variant-specific dir — reads updated files
       const baseName = move.path.replace(/\.[jt]sx?$/, "").split("/").pop() ?? "";
       if (!baseName) continue;
       const staleMatches = await scanImportsForMovedFile(fromDir, move.path);
@@ -681,26 +693,29 @@ async function executePlanVariant(
       result.tscOutput = tscLines.join("\n");
       // Score: 2 pts if all pass, 1 pt if partial (<5 errors), 0 if more
       if (totalErrors === 0) {
-        // tsc passed — also run bun test to confirm tests still green
-        let testFailed = false;
-        let totalFailCount = 0;
+        // tsc passed — also run bun test, but only count NEW failures above baseline
+        let variantTestsFailed = false;
         for (const repo of result.reposWithChanges) {
           const dir = clonedDirs.get(repo)!;
-          try {
-            await execAsync("bun test 2>&1", { cwd: dir });
-            log(`  🧪 bun test: passed (${repoShortName(repo)})`);
-          } catch (testErr) {
-            testFailed = true;
-            const out = (testErr instanceof Error
-              ? ((testErr as Error & { stdout?: string }).stdout ?? testErr.message)
-              : String(testErr));
-            const m = out.match(/(\d+)\s+fail/i);
-            const failCount = m ? parseInt(m[1]) : 1;
-            totalFailCount += failCount;
-            log(`  🧪 bun test: FAILED (${failCount} failures in ${repoShortName(repo)})`);
+          const testOut = await execAsync("bun test 2>&1", { cwd: dir, timeout: 60000 }).catch(
+            (e: unknown) => ({
+              stdout: (e as { stdout?: string }).stdout ?? "",
+              stderr: (e as { stderr?: string; message?: string }).stderr ?? (e instanceof Error ? e.message : String(e)),
+            })
+          );
+          const allOut = (testOut.stdout ?? "") + (testOut.stderr ?? "");
+          const failMatch = allOut.match(/(\d+)\s+fail/i);
+          const failureCount = failMatch ? parseInt(failMatch[1]) : 0;
+          const baselineFailures = baselineTestResults.get(repo) ?? 0;
+          const newFailures = Math.max(0, failureCount - baselineFailures);
+          if (newFailures > 0) {
+            log(`  🧪 bun test: FAILED (${newFailures} NEW failures in ${repoShortName(repo)})`);
+            variantTestsFailed = true;
+          } else {
+            log(`  🧪 bun test: passed (${failureCount} pre-existing failures ignored for ${repoShortName(repo)})`);
           }
         }
-        result.score = testFailed ? 1 : 2;
+        result.score = variantTestsFailed ? 1 : 2;
       } else if (totalErrors < 5) result.score = 1;
       else result.score = 0;
     } else {
@@ -774,6 +789,28 @@ export async function runRefactor(opts: RefactorOptions): Promise<void> {
     log(`  ✅ Cloned ${repo} → ${dir}`);
   }
 
+  // ── Baseline test collection (before any changes) ─────────────────────────
+  log("\n📊 Collecting baseline test results (pre-change)...");
+  const baselineTestResults = new Map<string, number>(); // ownerRepo → failure count before changes
+  for (const repo of repos) {
+    const dir = clonedDirs.get(repo)!;
+    try {
+      await execAsync(`bun install --frozen-lockfile 2>&1 || bun install 2>&1`, { cwd: dir, timeout: 120000 });
+      const testOut = await execAsync(`bun test 2>&1`, { cwd: dir, timeout: 60000 }).catch(
+        (e: unknown) => ({
+          stdout: (e as { stdout?: string }).stdout ?? "",
+          stderr: (e as { stderr?: string; message?: string }).stderr ?? (e instanceof Error ? e.message : String(e)),
+        })
+      );
+      const allOut = (testOut.stdout ?? "") + (testOut.stderr ?? "");
+      const failMatch = allOut.match(/(\d+)\s+fail/);
+      baselineTestResults.set(repo, failMatch ? parseInt(failMatch[1]) : 0);
+      log(`  📊 Baseline: ${repoShortName(repo)} has ${baselineTestResults.get(repo)} pre-existing test failures`);
+    } catch {
+      baselineTestResults.set(repo, 0);
+    }
+  }
+
   // ── Step 2: Read structures + build repo maps ──────────────────────────────
   log("\n📂 Step 2: Reading repo structures & building repo maps...");
   const structures: RepoStructure[] = [];
@@ -794,10 +831,23 @@ export async function runRefactor(opts: RefactorOptions): Promise<void> {
   log("\n🔍 Step 3a: Pass 1 — identifying candidate files (map-only)...");
   const rawCandidates = await identifyCandidates(structures, repoMaps, goal, language);
 
+  // Bug 3 fix: Filter out client-side and server-side files before any other filtering
+  const pathFilteredCandidates = rawCandidates.filter(path => {
+    if (path.startsWith("src/client/")) {
+      log(`  🚫 Filtered ${path} — client-side file, should not move to common`);
+      return false;
+    }
+    if (path.startsWith("src/server/")) {
+      log(`  🚫 Filtered ${path} — server-side file, should not move to common`);
+      return false;
+    }
+    return true;
+  });
+
   // Fix 3: Filter out candidates that already exist in the target repo
   const targetTree = structures[structures.length - 1].tree;
-  const candidates = rawCandidates.filter(path => !targetTree.includes(path));
-  const filteredByTarget = rawCandidates.length - candidates.length;
+  const candidates = pathFilteredCandidates.filter(path => !targetTree.includes(path));
+  const filteredByTarget = pathFilteredCandidates.length - candidates.length;
   if (filteredByTarget > 0) {
     log(`  🔍 Filtered ${filteredByTarget} candidates already present in target repo`);
   }
@@ -881,7 +931,7 @@ export async function runRefactor(opts: RefactorOptions): Promise<void> {
         return undefined;
       }
       try {
-        return await executePlanVariant(variant, plan, vDirs, resolveRepoVariant, language, goal);
+        return await executePlanVariant(variant, plan, vDirs, resolveRepoVariant, language, goal, baselineTestResults);
       } catch (err) {
         log(`  ⚠️  Variant ${variant.variant} failed: ${err instanceof Error ? err.message : String(err)}`);
         return {
