@@ -37,11 +37,105 @@ const WORKER_MODEL: Record<WorkerType, string> = {
   file_ops:    MODELS.light,
 };
 
+// ─── File dependency graph validation ────────────────────────────────────────
+// Parse file descriptions for import patterns and verify referenced files are planned.
+
+export function validateFileMap(graph: TaskGraph): string[] {
+  const warnings: string[] = [];
+  const plannedPaths = new Set(graph.fileMap.map(f => f.path));
+  const tasksByFile = new Map<string, boolean>(
+    graph.tasks.filter(t => t.targetFile).map(t => [t.targetFile!, true])
+  );
+
+  // Patterns that indicate a file references another file
+  const refPatterns = [
+    /imports?\s+(?:from\s+)?['"]?([a-zA-Z0-9_\-./]+\.ts)['"]?/gi,
+    /uses?\s+types?\s+from\s+['"]?([a-zA-Z0-9_\-./]+\.ts)['"]?/gi,
+    /depends?\s+on\s+['"]?([a-zA-Z0-9_\-./]+\.ts)['"]?/gi,
+    /requires?\s+['"]?([a-zA-Z0-9_\-./]+\.ts)['"]?/gi,
+  ];
+
+  for (const file of graph.fileMap) {
+    const desc = file.description;
+
+    // Collect all referenced files from description
+    const referenced = new Set<string>();
+    for (const pattern of refPatterns) {
+      pattern.lastIndex = 0;
+      let m;
+      while ((m = pattern.exec(desc)) !== null) {
+        const ref = m[1].replace(/^\.\//, ""); // normalize ./foo.ts → foo.ts
+        // Qualify with src/ if not already qualified
+        const qualified = ref.includes("/") ? ref : `src/${ref}`;
+        referenced.add(qualified);
+      }
+    }
+
+    for (const ref of referenced) {
+      if (!plannedPaths.has(ref)) {
+        warnings.push(`${file.path} references ${ref} but ${ref} has no planned task`);
+      }
+    }
+
+    // Check "entry point" / "main" files have a task
+    const isEntryPoint = /entry[\s-]?point|^main\b/i.test(desc);
+    if (isEntryPoint && !tasksByFile.has(file.path)) {
+      warnings.push(`${file.path} is marked as entry point/main but has no planned task`);
+    }
+  }
+
+  return warnings;
+}
+
+// ─── TDD task tier ordering ───────────────────────────────────────────────────
+// file_ops (types/interfaces) → test_runner → code_gen/debugger → doc_writer
+
+export function getTaskTier(worker: WorkerType): number {
+  switch (worker) {
+    case "file_ops":    return 0;
+    case "test_runner": return 1;
+    case "code_gen":    return 2;
+    case "debugger":    return 2;
+    case "doc_writer":  return 3;
+    default:            return 2;
+  }
+}
+
 export async function executeGraph(
   graph: TaskGraph,
   ctx: ExecutionContext
 ): Promise<TaskResult[]> {
   await mkdir(ctx.outputDir, { recursive: true });
+
+  // ── Validate file dependency graph before running any tasks ───────────────
+  const validationWarnings = validateFileMap(graph);
+  for (const warning of validationWarnings) {
+    console.log(`  ⚠️  dependency gap: ${warning}`);
+  }
+
+  // Auto-add tasks for files referenced but missing a planned task
+  const missingFileRe = /^.+ references (src\/[a-zA-Z0-9_\-./]+\.ts) but .+ has no planned task$/;
+  const autoAdded = new Set<string>();
+  for (const warning of validationWarnings) {
+    const m = missingFileRe.exec(warning);
+    if (m) {
+      const missing = m[1];
+      if (!autoAdded.has(missing) && !graph.tasks.find(t => t.targetFile === missing)) {
+        graph.tasks.push({
+          id: `auto-${missing}`,
+          worker: "code_gen",
+          description: `Implement ${missing}`,
+          targetFile: missing,
+          dependsOn: [],
+          status: "pending",
+          exports: [],
+          context: { files: [], notes: "" },
+        });
+        autoAdded.add(missing);
+        console.log(`  ➕ auto-added task for missing dependency: ${missing}`);
+      }
+    }
+  }
 
   // Spin up sandbox for this run
   const sandbox = new Sandbox(ctx.outputDir, ctx.language);
@@ -58,8 +152,13 @@ export async function executeGraph(
   const builtContext: string[] = []; // carry-forward context, compressed as needed
 
   while (true) {
-    const ready = readyTasks(graph);
-    if (ready.length === 0) break;
+    const allReady = readyTasks(graph);
+    if (allReady.length === 0) break;
+
+    // TDD ordering: pick only the lowest-tier tasks in this batch
+    allReady.sort((a, b) => getTaskTier(a.worker) - getTaskTier(b.worker));
+    const currentTier = getTaskTier(allReady[0].worker);
+    const ready = allReady.filter(t => getTaskTier(t.worker) === currentTier);
 
     const contextSnapshot = builtContext.join("\n\n");
 
@@ -665,6 +764,7 @@ function buildSystemPrompt(worker: WorkerType, lang: string): string {
 
     case "test_runner":
       return `You are an expert ${lang} test engineer using Bun's test runner.
+IMPORTANT: Tests are written BEFORE the implementation — write tests against the interface/types only, not a specific implementation.
 - Import test utilities from "bun:test": import { describe, it, expect, beforeEach } from "bun:test"
 - Import the actual functions from the source files using relative paths — don't reimplement them
 - Write comprehensive tests: happy path, edge cases, and error conditions
