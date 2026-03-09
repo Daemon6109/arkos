@@ -210,14 +210,23 @@ export async function runFinalizeExecutor(opts: ExecutorOptions): Promise<void> 
   }
 
   // 6. bun install + tsc validation
-  // Write .npmrc with GitHub token for private package registry auth
-  const githubToken = process.env.GITHUB_TOKEN;
-  if (githubToken) {
-    const npmrc = `//npm.pkg.github.com/:_authToken=${githubToken}\n@king-studios-rbx:registry=https://npm.pkg.github.com\n`;
+  // Write .npmrc with GitHub token for private package registry auth.
+  // Use `gh auth token` to get the already-configured gh CLI token — avoids
+  // needing a separate env var that would also interfere with git auth.
+  let ghToken: string | null = null;
+  try {
+    const { stdout } = await execAsync("gh auth token 2>/dev/null", { timeout: 5000 });
+    ghToken = stdout.trim() || null;
+  } catch {
+    // gh not configured or not available
+  }
+
+  if (ghToken) {
+    const npmrc = `//npm.pkg.github.com/:_authToken=${ghToken}\n@king-studios-rbx:registry=https://npm.pkg.github.com\n`;
     await writeRepoFile(cloneDir, ".npmrc", npmrc);
-    console.log(`\n📦 Running bun install (with GitHub Package Registry auth)...`);
+    console.log(`\n📦 Running bun install (GitHub Package Registry auth via gh CLI)...`);
   } else {
-    console.log(`\n📦 Running bun install (no GITHUB_TOKEN — private packages may fail)...`);
+    console.log(`\n📦 Running bun install (no gh token found — private packages may fail)...`);
   }
   try {
     await execAsync("bun install", { cwd: cloneDir, timeout: 120_000 });
