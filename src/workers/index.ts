@@ -8,6 +8,8 @@ import type { TaskGraph, Task, TaskResult, WorkerType } from "../types.js";
 import { mkdir, writeFile, readFile, readdir } from "fs/promises";
 import { join, dirname } from "path";
 import { existsSync } from "fs";
+import { Sandbox } from "../sandbox/index.js";
+import { runAgenticWorker } from "./agent.js";
 
 export interface ExecutionContext {
   outputDir: string;
@@ -41,6 +43,10 @@ export async function executeGraph(
 ): Promise<TaskResult[]> {
   await mkdir(ctx.outputDir, { recursive: true });
 
+  // Spin up sandbox for this run
+  const sandbox = new Sandbox(ctx.outputDir, ctx.language);
+  await sandbox.setup();
+
   // Write the file map as a reference for workers
   await writeFile(
     join(ctx.outputDir, ".arkos-filemap.json"),
@@ -57,13 +63,38 @@ export async function executeGraph(
 
     const contextSnapshot = builtContext.join("\n\n");
 
+    const fileMapSummary = graph.fileMap
+      .map(f => `  ${f.path} — ${f.description} [exports: ${f.exports.join(", ") || "none"}]`)
+      .join("\n");
+
     const batchResults = await Promise.all(
       ready.map(async (task) => {
         task.status = "running";
+        console.log(`  → [${task.worker}] ${task.targetFile ?? task.description}`);
         try {
-          const result = await executeTask(task, graph, { ...ctx, priorContext: contextSnapshot });
+          // Read existing files for context
+          const existingCode = await readExistingFiles(ctx.outputDir, graph, task);
+
+          // Use agentic worker — multi-turn with real sandbox execution
+          const agentResult = await runAgenticWorker(
+            task,
+            sandbox,
+            fileMapSummary,
+            contextSnapshot,
+            existingCode
+          );
+
+          if (agentResult.turns > 1) {
+            console.log(`    ↻ fixed in ${agentResult.turns} turns (tools: ${agentResult.toolsUsed.join(", ")})`);
+          }
+
           task.status = "complete";
-          return result;
+          return {
+            taskId: task.id,
+            output: agentResult.output,
+            confidence: agentResult.confidence,
+            worker: task.worker,
+          } satisfies TaskResult;
         } catch (err) {
           task.status = "failed";
           console.error(`  ✗ [${task.worker}] failed: ${err}`);
@@ -103,6 +134,7 @@ export async function executeGraph(
     results.push(...batchResults);
   }
 
+  await sandbox.teardown();
   return results;
 }
 
