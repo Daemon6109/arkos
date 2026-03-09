@@ -1,5 +1,6 @@
 // ─── Refactor Pipeline ────────────────────────────────────────────────────────
 // Cross-repo code analysis and refactoring via LLM-guided moves + PRs
+// v2: Two-pass analysis to avoid context overload
 
 import { cloneRepo, createBranch, commitAll, pushBranch, openPR } from "../tools/git.js";
 import {
@@ -9,7 +10,9 @@ import {
   deleteRepoFile,
   type RepoStructure,
 } from "../tools/repo_reader.js";
-import { generate, extractJson, parseJsonSafe } from "../ollama.js";
+import { buildRepoMap, formatRepoMap, type RepoMap } from "../tools/repo_map.js";
+import { generate, parseJsonSafe } from "../ollama.js";
+import { join } from "path";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -50,39 +53,223 @@ interface RefactorPlan {
   summary: string;
 }
 
+interface CandidateList {
+  candidates: string[];
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function log(msg: string) {
   console.log(msg);
 }
 
-/** Build a combined context string showing both repo trees and key file excerpts */
-function buildCombinedContext(structures: RepoStructure[]): string {
-  const parts: string[] = [];
-
-  structures.forEach((s, i) => {
-    const repoLabel = `REPO ${i + 1}: ${s.ownerRepo}`;
-    const tree = s.tree;
-
-    // Include first 200 lines of key source files
-    const keyFileContents = s.files
-      .filter((f) => /\.(ts|tsx|js|jsx|lua|py|go|rs)$/.test(f.path))
-      .slice(0, 30) // max 30 files
-      .map((f) => {
-        const lines = f.content.split("\n").slice(0, 200).join("\n");
-        return `--- FILE: ${f.path} ---\n${lines}`;
-      })
-      .join("\n\n");
-
-    parts.push(`${repoLabel}\n${tree}\n\nKey files:\n${keyFileContents}`);
-  });
-
-  return parts.join("\n\n---\n\n");
+/** Extract the short repo name (without owner) */
+function repoShortName(ownerRepo: string): string {
+  return ownerRepo.split("/")[1] ?? ownerRepo;
 }
 
-/** Extract the short repo name (without owner) */
-function repoName(ownerRepo: string): string {
-  return ownerRepo.split("/")[1] ?? ownerRepo;
+/** Build compact package.json summary for LLM (name, version, dependencies keys) */
+function packageSummary(pkg: Record<string, unknown> | undefined): string {
+  if (!pkg) return "(no package.json)";
+  const deps = Object.keys((pkg.dependencies as Record<string, unknown>) ?? {});
+  const devDeps = Object.keys((pkg.devDependencies as Record<string, unknown>) ?? {});
+  return [
+    `name: ${pkg.name ?? "?"}`,
+    `version: ${pkg.version ?? "?"}`,
+    deps.length > 0 ? `deps: ${deps.join(", ")}` : null,
+    devDeps.length > 0 ? `devDeps: ${devDeps.slice(0, 10).join(", ")}${devDeps.length > 10 ? "..." : ""}` : null,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+}
+
+// ─── Pass 1: Candidate identification ────────────────────────────────────────
+
+/**
+ * Pass 1 — Send only repo maps (no file contents) and ask the model which files
+ * are worth examining. Returns up to 15 candidate paths.
+ */
+async function identifyCandidates(
+  structures: RepoStructure[],
+  repoMaps: RepoMap[],
+  goal: string,
+  language: string
+): Promise<string[]> {
+  const repoParts = structures.map((s, i) => {
+    const map = repoMaps[i];
+    return `REPO ${i + 1}: ${s.ownerRepo}
+Package.json: ${packageSummary(s.packageJson)}
+File tree:
+${s.tree}
+Symbol map:
+${map.summary}`;
+  });
+
+  const prompt = `You are a senior ${language} architect reviewing ${structures.length} repos.
+GOAL: ${goal}
+
+${repoParts.join("\n\n")}
+
+Based on the file trees and symbol maps, list up to 15 specific files that are strong candidates for moving between repos (shared utilities, types, duplicated logic, etc.).
+Only list files that exist in the trees above.
+
+Respond ONLY with valid JSON (no markdown, no extra text):
+{ "candidates": ["src/shared/utils/server_time.ts", "src/types/index.ts"] }`;
+
+  const raw = await generate(
+    prompt,
+    { model: "qwen3:14b", num_ctx: 16384, num_predict: 1024 },
+    "refactor_pass1"
+  );
+
+  const result = parseJsonSafe<CandidateList>(raw, { candidates: [] });
+
+  log(`  📋 Pass 1 identified ${result.candidates.length} candidate files:`);
+  for (const c of result.candidates) {
+    log(`    • ${c}`);
+  }
+
+  return result.candidates;
+}
+
+// ─── Pass 2: Full refactor plan ───────────────────────────────────────────────
+
+/**
+ * Pass 2 — Read actual contents of candidate files and ask for the full plan.
+ */
+async function buildRefactorPlan(
+  structures: RepoStructure[],
+  candidates: string[],
+  goal: string,
+  language: string,
+  shortNameMap: Map<string, string>,
+  clonedDirs: Map<string, string>
+): Promise<RefactorPlan> {
+  const fallback: RefactorPlan = {
+    filesToMove: [],
+    importsToUpdate: [],
+    versionBumps: [],
+    summary: "No plan generated",
+  };
+
+  if (candidates.length === 0) return fallback;
+
+  // Read candidate file contents from all repos
+  const fileContentParts: string[] = [];
+  for (const structure of structures) {
+    const shortName = repoShortName(structure.ownerRepo);
+    const repoDir = clonedDirs.get(structure.ownerRepo) ?? "";
+
+    for (const candidatePath of candidates) {
+      const content = await readRepoFile(repoDir, candidatePath);
+      if (content) {
+        // Truncate at 150 lines to prevent context overload
+        const truncated = content.split("\n").slice(0, 150).join("\n");
+        fileContentParts.push(`--- FILE: ${shortName}/${candidatePath} ---\n${truncated}`);
+      }
+    }
+  }
+
+  // Target repo structure (the last repo is the "common" target by convention)
+  const targetStructure = structures[structures.length - 1];
+
+  const prompt = `You are a senior ${language} architect.
+GOAL: ${goal}
+
+CANDIDATE FILES (contents — decide what to move):
+${fileContentParts.join("\n\n")}
+
+TARGET REPO STRUCTURE (${targetStructure.ownerRepo}):
+${targetStructure.tree}
+
+REPO SHORT NAMES: ${structures.map((s, i) => `REPO ${i + 1} = "${repoShortName(s.ownerRepo)}"`).join(", ")}
+
+Based on the goal and file contents, output a refactor plan. Use only the short repo names (without owner) in all fields.
+
+Respond ONLY with valid JSON (no markdown, no extra text):
+{
+  "filesToMove": [
+    {
+      "fromRepo": "<short name>",
+      "path": "src/shared/utils/server_time.ts",
+      "toRepo": "<short name>",
+      "targetPath": "packages/utils/src/server_time.ts",
+      "reason": "..."
+    }
+  ],
+  "importsToUpdate": [
+    {
+      "repo": "<short name>",
+      "file": "src/...",
+      "oldImport": "...",
+      "newImport": "..."
+    }
+  ],
+  "versionBumps": [
+    {
+      "repo": "<short name>",
+      "packagePath": "packages/utils/package.json",
+      "field": "version",
+      "newValue": "0.3.0"
+    }
+  ],
+  "summary": "..."
+}`;
+
+  const raw = await generate(
+    prompt,
+    { model: "qwen3:14b", num_ctx: 24576, num_predict: 4096 },
+    "refactor_pass2"
+  );
+
+  return parseJsonSafe<RefactorPlan>(raw, fallback);
+}
+
+// ─── Verification step ────────────────────────────────────────────────────────
+
+/**
+ * After executing the plan, re-read modified files and ask the model
+ * if they look correct. Log warnings if issues found.
+ */
+async function verifyModifiedFiles(
+  modifiedFiles: Array<{ repoDir: string; path: string; repoName: string }>,
+  goal: string,
+  language: string
+): Promise<void> {
+  if (modifiedFiles.length === 0) return;
+
+  log("\n🔎 Verification: checking modified files...");
+
+  for (const { repoDir, path, repoName } of modifiedFiles) {
+    const content = await readRepoFile(repoDir, path);
+    if (!content) {
+      log(`  ⚠️  Could not re-read ${repoName}/${path} for verification`);
+      continue;
+    }
+
+    const truncated = content.split("\n").slice(0, 100).join("\n");
+    const verifyPrompt = `You are reviewing a ${language} file after a refactor.
+GOAL: ${goal}
+FILE: ${repoName}/${path}
+
+${truncated}
+
+Does this file look correct after the refactor? Any obvious issues (broken imports, wrong paths, missing exports, syntax errors)?
+Reply with a brief assessment. If there are issues, start your reply with "ISSUE:". If it looks fine, start with "OK:".`;
+
+    const raw = await generate(
+      verifyPrompt,
+      { model: "qwen3:14b", num_ctx: 8192, num_predict: 256 },
+      "refactor_verify"
+    );
+
+    const stripped = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    if (stripped.startsWith("ISSUE:")) {
+      log(`  ⚠️  ${repoName}/${path}: ${stripped}`);
+    } else {
+      log(`  ✅ ${repoName}/${path}: ${stripped.slice(0, 100)}`);
+    }
+  }
 }
 
 // ─── Pipeline ─────────────────────────────────────────────────────────────────
@@ -97,129 +284,84 @@ export async function runRefactor(opts: RefactorOptions): Promise<void> {
     throw new Error("refactor requires at least 2 repos (--repos owner/repo1 owner/repo2)");
   }
 
-  // ── Step 1: Clone repos ────────────────────────────────────────────────────
-  log("\n🔁 Step 1: Cloning repos...");
-  const clonedDirs: Record<string, string> = {};
+  // ── Maps for deterministic repo lookup (short name → full ownerRepo) ────────
+  const shortNameMap = new Map<string, string>(); // "Anime-Reborn-Lobby" → "King-Studios-RBX/Anime-Reborn-Lobby"
+  const clonedDirs = new Map<string, string>();   // ownerRepo → local cloned dir
 
   for (const repo of repos) {
-    const name = repoName(repo);
+    shortNameMap.set(repoShortName(repo), repo);
+  }
+
+  // ── Helper: resolve ownerRepo from short or full name ──────────────────────
+  function resolveRepo(nameOrOwner: string): string | undefined {
+    // Exact match (full ownerRepo)
+    if (clonedDirs.has(nameOrOwner)) return nameOrOwner;
+    // Short name match
+    const full = shortNameMap.get(nameOrOwner);
+    if (full) return full;
+    // Fuzzy: find any repo whose short name contains nameOrOwner
+    for (const [short, full] of shortNameMap) {
+      if (short.includes(nameOrOwner) || nameOrOwner.includes(short)) return full;
+    }
+    return undefined;
+  }
+
+  // ── Step 1: Clone repos ────────────────────────────────────────────────────
+  log("\n🔁 Step 1: Cloning repos...");
+
+  for (const repo of repos) {
+    const name = repoShortName(repo);
     const dest = `/tmp/arkos-refactor/${name}-${timestamp}`;
     log(`  📦 Cloning ${repo}...`);
     const dir = await cloneRepo(repo, dest);
-    clonedDirs[repo] = dir;
+    clonedDirs.set(repo, dir);
     log(`  ✅ Cloned ${repo} → ${dir}`);
   }
 
-  // ── Step 2: Read structures ────────────────────────────────────────────────
-  log("\n📂 Step 2: Reading repo structures...");
+  // ── Step 2: Read structures + build repo maps ──────────────────────────────
+  log("\n📂 Step 2: Reading repo structures & building repo maps...");
   const structures: RepoStructure[] = [];
+  const repoMaps: RepoMap[] = [];
 
   for (const repo of repos) {
-    const dir = clonedDirs[repo];
+    const dir = clonedDirs.get(repo)!;
     const structure = await readRepoStructure(dir, repo);
     structures.push(structure);
     log(`  📄 ${repo}: ${structure.files.length} files`);
+
+    const repoMap = await buildRepoMap(dir);
+    repoMaps.push(repoMap);
+    log(`  🗺️  ${repo}: ${repoMap.files.length} source files mapped`);
   }
 
-  const combinedContext = buildCombinedContext(structures);
+  // ── Step 3a: Pass 1 — identify candidate files (no raw content) ──────────
+  log("\n🔍 Step 3a: Pass 1 — identifying candidate files (map-only)...");
+  const candidates = await identifyCandidates(structures, repoMaps, goal, language);
 
-  // ── Step 3: Analyze — what should move? ────────────────────────────────────
-  log("\n🔍 Step 3: Analyzing repos with LLM...");
+  if (candidates.length === 0) {
+    log("\n⚠️  Pass 1 found no candidate files. Refactor complete (nothing to do).");
+    return;
+  }
 
-  const repoLabels = repos
-    .map((r, i) => `REPO ${i + 1} = "${repoName(r)}"`)
-    .join(", ");
-
-  const analyzePrompt = `You are a senior ${language}/roblox-ts architect reviewing ${repos.length} repos.
-
-GOAL: ${goal}
-
-Repo mapping: ${repoLabels}
-
-${combinedContext}
-
-Identify files in the repos that:
-1. Have no repo-specific dependencies (don't import from local-only modules)
-2. Would be useful to share or move between repos (common/shared utilities, types, etc.)
-3. Are duplicated or equivalent across repos
-
-Respond ONLY with valid JSON (no markdown fences, no extra text):
-{
-  "filesToMove": [
-    {
-      "fromRepo": "<repo name without owner>",
-      "path": "src/shared/utils/server_time.ts",
-      "toRepo": "<repo name without owner>",
-      "targetPath": "packages/utils/src/server_time.ts",
-      "reason": "..."
-    }
-  ],
-  "importsToUpdate": [
-    {
-      "repo": "<repo name without owner>",
-      "file": "src/...",
-      "oldImport": "...",
-      "newImport": "..."
-    }
-  ],
-  "versionBumps": [
-    {
-      "repo": "<repo name without owner>",
-      "packagePath": "packages/utils/package.json",
-      "field": "version",
-      "newValue": "0.3.0"
-    }
-  ],
-  "summary": "..."
-}`;
-
-  if (verbose) log(`\n[ANALYZE PROMPT]\n${analyzePrompt.slice(0, 500)}...\n`);
-
-  const analyzeRaw = await generate(analyzePrompt, { model: "qwen3:14b", num_ctx: 32768 }, "refactor_analyzer");
-  const plan = parseJsonSafe<RefactorPlan>(analyzeRaw, {
-    filesToMove: [],
-    importsToUpdate: [],
-    versionBumps: [],
-    summary: "No plan generated",
-  });
+  // ── Step 3b: Pass 2 — full plan with candidate contents ───────────────────
+  log(`\n🔍 Step 3b: Pass 2 — deep analysis of ${candidates.length} candidate files...`);
+  const plan = await buildRefactorPlan(
+    structures,
+    candidates,
+    goal,
+    language,
+    shortNameMap,
+    clonedDirs
+  );
 
   if (verbose) log(`\n[PLAN]\n${JSON.stringify(plan, null, 2)}\n`);
 
   // ── Step 4: Plan review ────────────────────────────────────────────────────
   log("\n📋 Step 4: Reviewing plan...");
-  log(`  Files to move:    ${plan.filesToMove.length}`);
+  log(`  Files to move:     ${plan.filesToMove.length}`);
   log(`  Imports to update: ${plan.importsToUpdate.length}`);
   log(`  Version bumps:     ${plan.versionBumps.length}`);
   log(`  Summary: ${plan.summary}`);
-
-  if (plan.filesToMove.length > 0) {
-    const reviewPrompt = `You are reviewing a code refactoring plan.
-
-GOAL: ${goal}
-
-PROPOSED PLAN:
-${JSON.stringify(plan, null, 2)}
-
-REPO TREES:
-${structures.map((s, i) => `REPO ${i + 1} (${s.ownerRepo}):\n${s.tree}`).join("\n\n")}
-
-Does this plan make sense? Are there any missing import updates or version changes?
-If corrections are needed, respond with a corrected JSON plan in the same format.
-If the plan is good, respond with the same JSON unchanged.
-
-Respond ONLY with valid JSON:`;
-
-    const reviewRaw = await generate(reviewPrompt, { model: "qwen3:14b", num_ctx: 16384 }, "refactor_planner");
-    const reviewed = parseJsonSafe<RefactorPlan>(reviewRaw, plan);
-
-    // Merge reviewed corrections (use reviewed if it has content)
-    if (reviewed.filesToMove?.length > 0 || reviewed.importsToUpdate?.length > 0) {
-      Object.assign(plan, reviewed);
-      log("  ✏️  Plan updated after review");
-    } else {
-      log("  ✅ Plan validated — no changes needed");
-    }
-  }
 
   if (plan.filesToMove.length === 0) {
     log("\n⚠️  No files identified to move. Refactor complete (nothing to do).");
@@ -232,43 +374,45 @@ Respond ONLY with valid JSON:`;
   // Determine which repos have changes
   const reposWithChanges = new Set<string>();
   for (const move of plan.filesToMove) {
-    // Find the ownerRepo matching the short name
-    const fromRepo = repos.find((r) => repoName(r) === move.fromRepo || r === move.fromRepo);
-    const toRepo = repos.find((r) => repoName(r) === move.toRepo || r === move.toRepo);
+    const fromRepo = resolveRepo(move.fromRepo);
+    const toRepo = resolveRepo(move.toRepo);
     if (fromRepo) reposWithChanges.add(fromRepo);
     if (toRepo) reposWithChanges.add(toRepo);
   }
   for (const imp of plan.importsToUpdate) {
-    const repo = repos.find((r) => repoName(r) === imp.repo || r === imp.repo);
+    const repo = resolveRepo(imp.repo);
     if (repo) reposWithChanges.add(repo);
   }
   for (const bump of plan.versionBumps) {
-    const repo = repos.find((r) => repoName(r) === bump.repo || r === bump.repo);
+    const repo = resolveRepo(bump.repo);
     if (repo) reposWithChanges.add(repo);
   }
 
   // Create branches in repos with changes
   for (const repo of reposWithChanges) {
-    const dir = clonedDirs[repo];
+    const dir = clonedDirs.get(repo)!;
     log(`  🌿 Creating branch ${branchName} in ${repo}...`);
     await createBranch(dir, branchName);
   }
 
+  // Track modified files for verification
+  const modifiedFiles: Array<{ repoDir: string; path: string; repoName: string }> = [];
+
   // Execute file moves
   let movedCount = 0;
   for (const move of plan.filesToMove) {
-    const fromRepo = repos.find((r) => repoName(r) === move.fromRepo || r === move.fromRepo);
-    const toRepo = repos.find((r) => repoName(r) === move.toRepo || r === move.toRepo);
+    const fromRepo = resolveRepo(move.fromRepo);
+    const toRepo = resolveRepo(move.toRepo);
 
     if (!fromRepo || !toRepo) {
       log(`  ⚠️  Could not find repos for move: ${move.fromRepo} → ${move.toRepo}, skipping`);
       continue;
     }
 
-    const fromDir = clonedDirs[fromRepo];
-    const toDir = clonedDirs[toRepo];
+    const fromDir = clonedDirs.get(fromRepo)!;
+    const toDir = clonedDirs.get(toRepo)!;
 
-    log(`  📁 Moving ${move.path} (${move.fromRepo} → ${move.toRepo})`);
+    log(`  📁 Moving ${move.path} (${repoShortName(fromRepo)} → ${repoShortName(toRepo)})`);
 
     const content = await readRepoFile(fromDir, move.path);
     if (!content) {
@@ -277,6 +421,8 @@ Respond ONLY with valid JSON:`;
     }
 
     await writeRepoFile(toDir, move.targetPath, content);
+    modifiedFiles.push({ repoDir: toDir, path: move.targetPath, repoName: repoShortName(toRepo) });
+
     if (fromRepo !== toRepo) {
       await deleteRepoFile(fromDir, move.path);
     }
@@ -286,16 +432,17 @@ Respond ONLY with valid JSON:`;
   // Update imports
   let importUpdateCount = 0;
   for (const imp of plan.importsToUpdate) {
-    const repo = repos.find((r) => repoName(r) === imp.repo || r === imp.repo);
+    const repo = resolveRepo(imp.repo);
     if (!repo) continue;
 
-    const dir = clonedDirs[repo];
+    const dir = clonedDirs.get(repo)!;
     const content = await readRepoFile(dir, imp.file);
     if (!content) continue;
 
     if (content.includes(imp.oldImport)) {
       const updated = content.split(imp.oldImport).join(imp.newImport);
       await writeRepoFile(dir, imp.file, updated);
+      modifiedFiles.push({ repoDir: dir, path: imp.file, repoName: repoShortName(repo) });
       log(`  🔗 Updated import in ${imp.file}: "${imp.oldImport}" → "${imp.newImport}"`);
       importUpdateCount++;
     }
@@ -303,10 +450,10 @@ Respond ONLY with valid JSON:`;
 
   // Apply version bumps
   for (const bump of plan.versionBumps) {
-    const repo = repos.find((r) => repoName(r) === bump.repo || r === bump.repo);
+    const repo = resolveRepo(bump.repo);
     if (!repo) continue;
 
-    const dir = clonedDirs[repo];
+    const dir = clonedDirs.get(repo)!;
     const content = await readRepoFile(dir, bump.packagePath);
     if (!content) continue;
 
@@ -320,6 +467,9 @@ Respond ONLY with valid JSON:`;
     }
   }
 
+  // ── Step 5b: Verification ──────────────────────────────────────────────────
+  await verifyModifiedFiles(modifiedFiles, goal, language);
+
   // ── Step 6: Create PRs ─────────────────────────────────────────────────────
   const prUrls: string[] = [];
 
@@ -327,16 +477,17 @@ Respond ONLY with valid JSON:`;
     log("\n🚀 Step 6: Creating PRs...");
 
     for (const repo of reposWithChanges) {
-      const dir = clonedDirs[repo];
+      const dir = clonedDirs.get(repo)!;
+      const shortName = repoShortName(repo);
 
       const repoMoves = plan.filesToMove.filter(
-        (m) => repoName(m.fromRepo) === repoName(repo) || repoName(m.toRepo) === repoName(repo)
+        (m) => resolveRepo(m.fromRepo) === repo || resolveRepo(m.toRepo) === repo
       );
       const repoImports = plan.importsToUpdate.filter(
-        (i) => repoName(i.repo) === repoName(repo)
+        (i) => resolveRepo(i.repo) === repo
       );
       const repoBumps = plan.versionBumps.filter(
-        (b) => repoName(b.repo) === repoName(repo)
+        (b) => resolveRepo(b.repo) === repo
       );
 
       const prBody = `## Arkos Refactor
@@ -355,22 +506,20 @@ ${repoBumps.length > 0 ? `\n**Version bumps:**\n${repoBumps.map((b) => `- \`${b.
       try {
         await commitAll(dir, `refactor: ${plan.summary}`);
         await pushBranch(dir, branchName);
-        const prUrl = await openPR(
-          dir,
-          `refactor: ${plan.summary}`,
-          prBody
-        );
+        const prUrl = await openPR(dir, `refactor: ${plan.summary}`, prBody);
         prUrls.push(prUrl);
         log(`  ✅ PR opened: ${prUrl}`);
       } catch (err) {
-        log(`  ⚠️  Could not open PR for ${repo}: ${err instanceof Error ? err.message : String(err)}`);
+        log(
+          `  ⚠️  Could not open PR for ${repo}: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     }
   } else {
     log("\n⏭️  Step 6: Skipped (--no-pr)");
     log("  Changes committed to branches in:");
     for (const repo of reposWithChanges) {
-      const dir = clonedDirs[repo];
+      const dir = clonedDirs.get(repo)!;
       try {
         await commitAll(dir, `refactor: ${plan.summary}`);
         log(`    ✅ ${repo} → ${dir} (branch: ${branchName})`);
