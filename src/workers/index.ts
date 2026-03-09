@@ -219,8 +219,12 @@ If it needs fixes: respond with ONLY the corrected \`\`\`${lang.toLowerCase()}\`
 }
 
 // ─── Assembly pass ────────────────────────────────────────────────────────────
-// After all tasks complete, write package.json + tsconfig if missing,
-// and verify the entry point imports everything correctly.
+// After all tasks complete:
+// 1. Scan all source files for external imports
+// 2. Map imports → npm package names + versions
+// 3. Write correct package.json with real deps
+// 4. Write tsconfig.json, README
+// 5. Interface validation — catch signature mismatches between files
 
 export async function assembleProject(
   graph: TaskGraph,
@@ -230,30 +234,49 @@ export async function assembleProject(
 
   const lang = ctx.language;
 
-  // Write package.json if not already written by a task
-  const hasPackageJson = existsSync(join(ctx.outputDir, "package.json"));
-  if (!hasPackageJson) {
-    const name = ctx.projectName.toLowerCase().replace(/\s+/g, "-");
-    const pkg = {
-      name,
-      version: "0.1.0",
-      description: graph.goal,
-      scripts: lang === "TypeScript"
-        ? { build: "tsc", start: "node dist/index.js", dev: "tsx src/index.ts" }
-        : { start: "node src/index.js" },
-      dependencies: {},
-      devDependencies: lang === "TypeScript"
-        ? { typescript: "^5.4.0", tsx: "^4.7.0", "@types/node": "^20.0.0" }
-        : {},
-    };
-    await writeFile(join(ctx.outputDir, "package.json"), JSON.stringify(pkg, null, 2), "utf-8");
-    console.log("    ✓ package.json");
+  // ── Scan all source files for imports ─────────────────────────────────────
+  const sourceFiles = await collectSourceFiles(ctx.outputDir);
+  const externalDeps = await detectExternalDeps(sourceFiles, lang);
+
+  if (externalDeps.dependencies && Object.keys(externalDeps.dependencies).length > 0) {
+    console.log(`    📦 Detected deps: ${Object.keys(externalDeps.dependencies).join(", ")}`);
   }
 
-  // Write tsconfig.json for TypeScript projects
+  // ── Write package.json (always — with correct deps) ───────────────────────
+  const pkgPath = join(ctx.outputDir, "package.json");
+  const existingPkg = existsSync(pkgPath)
+    ? JSON.parse(await readFile(pkgPath, "utf-8").catch(() => "{}"))
+    : {};
+
+  const name = ctx.projectName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  const pkg = {
+    name: existingPkg.name ?? name,
+    version: existingPkg.version ?? "0.1.0",
+    description: existingPkg.description ?? graph.goal,
+    main: lang === "TypeScript" ? "dist/index.js" : "src/index.js",
+    scripts: lang === "TypeScript"
+      ? { build: "tsc", start: "node dist/index.js", dev: "tsx src/index.ts", test: "jest" }
+      : { start: "node src/index.js", test: "jest" },
+    dependencies: {
+      ...(existingPkg.dependencies ?? {}),
+      ...(externalDeps.dependencies ?? {}),
+    },
+    devDependencies: {
+      ...(lang === "TypeScript"
+        ? { typescript: "^5.4.0", tsx: "^4.7.0", "@types/node": "^20.0.0", jest: "^29.0.0", "ts-jest": "^29.0.0", "@types/jest": "^29.0.0" }
+        : { jest: "^29.0.0" }),
+      ...(existingPkg.devDependencies ?? {}),
+      ...(externalDeps.devDependencies ?? {}),
+    },
+  };
+
+  await writeFile(pkgPath, JSON.stringify(pkg, null, 2), "utf-8");
+  console.log("    ✓ package.json (with detected deps)");
+
+  // ── tsconfig.json ─────────────────────────────────────────────────────────
   if (lang === "TypeScript") {
-    const hasTsConfig = existsSync(join(ctx.outputDir, "tsconfig.json"));
-    if (!hasTsConfig) {
+    const tsconfigPath = join(ctx.outputDir, "tsconfig.json");
+    if (!existsSync(tsconfigPath)) {
       const tsconfig = {
         compilerOptions: {
           target: "ES2022", module: "CommonJS",
@@ -262,19 +285,157 @@ export async function assembleProject(
           skipLibCheck: true, declaration: true,
         },
         include: ["src/**/*"],
-        exclude: ["node_modules", "dist", "tests"],
+        exclude: ["node_modules", "dist"],
       };
-      await writeFile(join(ctx.outputDir, "tsconfig.json"), JSON.stringify(tsconfig, null, 2), "utf-8");
+      await writeFile(tsconfigPath, JSON.stringify(tsconfig, null, 2), "utf-8");
       console.log("    ✓ tsconfig.json");
     }
   }
 
-  // Write a README stub if none exists
-  const hasReadme = existsSync(join(ctx.outputDir, "README.md"));
-  if (!hasReadme) {
-    const readme = `# ${ctx.projectName}\n\n${graph.goal}\n\n## Setup\n\n\`\`\`bash\nnpm install\nnpm run dev\n\`\`\`\n`;
+  // ── README ────────────────────────────────────────────────────────────────
+  if (!existsSync(join(ctx.outputDir, "README.md"))) {
+    const depList = Object.keys(externalDeps.dependencies ?? {}).join(", ");
+    const readme = [
+      `# ${ctx.projectName}`,
+      ``,
+      `${graph.goal}`,
+      ``,
+      `## Setup`,
+      ``,
+      "```bash",
+      "npm install",
+      lang === "TypeScript" ? "npm run dev" : "npm start",
+      "```",
+      depList ? `\n## Dependencies\n\n${depList}` : "",
+    ].join("\n");
     await writeFile(join(ctx.outputDir, "README.md"), readme, "utf-8");
     console.log("    ✓ README.md");
+  }
+
+  // ── Interface validation ───────────────────────────────────────────────────
+  await validateInterfaces(sourceFiles, ctx.outputDir, lang);
+}
+
+// ─── Dependency detection ─────────────────────────────────────────────────────
+// Read all source files, extract import statements, map to npm packages.
+
+async function collectSourceFiles(outputDir: string): Promise<Map<string, string>> {
+  const files = new Map<string, string>();
+  const srcDir = join(outputDir, "src");
+  if (!existsSync(srcDir)) return files;
+
+  const entries = await readdir(srcDir).catch(() => [] as string[]);
+  for (const entry of entries) {
+    const fullPath = join(srcDir, entry);
+    try {
+      const content = await readFile(fullPath, "utf-8");
+      files.set(`src/${entry}`, content);
+    } catch {}
+  }
+  return files;
+}
+
+// Known npm package mappings: import name → { dep, devDep, types }
+const KNOWN_PACKAGES: Record<string, { dep?: string; version?: string; types?: string }> = {
+  "date-fns":    { dep: "date-fns", version: "^3.6.0" },
+  "yargs":       { dep: "yargs", version: "^17.7.2", types: "@types/yargs" },
+  "commander":   { dep: "commander", version: "^12.0.0" },
+  "chalk":       { dep: "chalk", version: "^5.3.0" },
+  "ora":         { dep: "ora", version: "^8.0.1" },
+  "axios":       { dep: "axios", version: "^1.7.0" },
+  "express":     { dep: "express", version: "^4.19.0", types: "@types/express" },
+  "lodash":      { dep: "lodash", version: "^4.17.21", types: "@types/lodash" },
+  "dotenv":      { dep: "dotenv", version: "^16.4.0" },
+  "zod":         { dep: "zod", version: "^3.23.0" },
+  "inquirer":    { dep: "inquirer", version: "^10.0.0", types: "@types/inquirer" },
+  "glob":        { dep: "glob", version: "^11.0.0" },
+  "fs-extra":    { dep: "fs-extra", version: "^11.2.0", types: "@types/fs-extra" },
+  "kleur":       { dep: "kleur", version: "^4.1.5" },
+  "minimist":    { dep: "minimist", version: "^1.2.8", types: "@types/minimist" },
+  "table":       { dep: "table", version: "^6.8.2" },
+  "cli-table3":  { dep: "cli-table3", version: "^0.6.5", types: "@types/cli-table3" },
+};
+
+async function detectExternalDeps(
+  files: Map<string, string>,
+  lang: string
+): Promise<{ dependencies: Record<string, string>; devDependencies: Record<string, string> }> {
+  const deps: Record<string, string> = {};
+  const devDeps: Record<string, string> = {};
+
+  // Regex to match: import ... from 'pkg' and require('pkg')
+  const importRegex = /(?:import\s+.*?from\s+['"]([^.][^'"]*?)['"]|require\(['"]([^.][^'"]*?)['"]\))/g;
+
+  for (const [, content] of files) {
+    let match;
+    while ((match = importRegex.exec(content)) !== null) {
+      const pkg = (match[1] ?? match[2]).split("/")[0]; // handle scoped: @types/node → @types
+      if (!pkg || pkg.startsWith("@types")) continue;
+
+      const known = KNOWN_PACKAGES[pkg];
+      if (known?.dep) {
+        deps[known.dep] = known.version ?? "latest";
+        if (known.types && lang === "TypeScript") {
+          devDeps[known.types] = "latest";
+        }
+      }
+      // Unknown external package — add it with "latest" as a best guess
+      else if (!pkg.startsWith(".") && !["fs", "path", "os", "crypto", "child_process", "stream", "util", "events", "http", "https", "url", "net", "assert"].includes(pkg)) {
+        deps[pkg] = "latest";
+      }
+    }
+  }
+
+  return { dependencies: deps, devDependencies: devDeps };
+}
+
+// ─── Interface validation ─────────────────────────────────────────────────────
+// Scan imports across files and warn about obvious mismatches.
+
+async function validateInterfaces(
+  files: Map<string, string>,
+  outputDir: string,
+  lang: string
+): Promise<void> {
+  const issues: string[] = [];
+
+  // Build export map: filename → exported symbols
+  const exportMap = new Map<string, Set<string>>();
+  for (const [filename, content] of files) {
+    const exports = new Set<string>();
+    const exportRegex = /export\s+(?:function|const|class|interface|type|enum)\s+(\w+)/g;
+    let m;
+    while ((m = exportRegex.exec(content)) !== null) exports.add(m[1]);
+    exportMap.set(filename, exports);
+  }
+
+  // Check imports against export map
+  for (const [filename, content] of files) {
+    const importRegex = /import\s+\{([^}]+)\}\s+from\s+['"](\.[^'"]+)['"]/g;
+    let m;
+    while ((m = importRegex.exec(content)) !== null) {
+      const importedSymbols = m[1].split(",").map(s => s.trim().split(" as ")[0].trim());
+      const fromPath = m[2];
+
+      // Resolve relative path to a key in our file map
+      const resolvedKey = `src/${fromPath.replace(/^\.\//, "").replace(/\.ts$/, "")}.ts`;
+      const availableExports = exportMap.get(resolvedKey);
+
+      if (availableExports) {
+        for (const sym of importedSymbols) {
+          if (!availableExports.has(sym)) {
+            issues.push(`  ⚠️  ${filename} imports '${sym}' from '${fromPath}' but it's not exported there`);
+          }
+        }
+      }
+    }
+  }
+
+  if (issues.length > 0) {
+    console.log("    Interface validation issues found:");
+    issues.forEach(i => console.log(i));
+  } else {
+    console.log("    ✓ Interface validation passed");
   }
 }
 
