@@ -15,6 +15,9 @@ import { generate, parseJsonSafe } from "../ollama.js";
 import { join } from "path";
 import { readdir, readFile } from "fs/promises";
 import { storeRefactorLesson, getRefactorLessons } from "../memory/index.js";
+import { exec } from "child_process";
+import { promisify } from "util";
+const execAsync = promisify(exec);
 
 // Lazy-load tsc_checker so it degrades gracefully if not present
 import type { TscResult } from "../tools/tsc_checker.js";
@@ -259,6 +262,7 @@ async function buildRefactorPlan(
 
   // Read candidate file contents from all repos
   const fileContentParts: string[] = [];
+  const candidateContents = new Map<string, string>(); // path → content (for repo-specific import filter)
   for (const structure of structures) {
     const shortName = repoShortName(structure.ownerRepo);
     const repoDir = clonedDirs.get(structure.ownerRepo) ?? "";
@@ -266,6 +270,10 @@ async function buildRefactorPlan(
     for (const candidatePath of candidates) {
       const content = await readRepoFile(repoDir, candidatePath);
       if (content) {
+        // Accumulate for repo-specific import filter
+        if (!candidateContents.has(candidatePath)) {
+          candidateContents.set(candidatePath, content);
+        }
         // Truncate at 150 lines to prevent context overload
         const truncated = content.split("\n").slice(0, 150).join("\n");
         fileContentParts.push(`--- FILE: ${shortName}/${candidatePath} ---\n${truncated}`);
@@ -342,7 +350,7 @@ Respond ONLY with valid JSON (no markdown, no extra text):
       const rawMoves = Array.isArray(p.filesToMove) ? p.filesToMove : [];
       const rawImports = Array.isArray(p.importsToUpdate) ? p.importsToUpdate : [];
       const rawBumps = Array.isArray(p.versionBumps) ? p.versionBumps : [];
-      return {
+      const plan: RefactorPlan = {
         filesToMove: rawMoves
           .filter((m): m is Record<string, unknown> => typeof m === "object" && m !== null)
           .map(normalizeFileToMove)
@@ -353,6 +361,23 @@ Respond ONLY with valid JSON (no markdown, no extra text):
         versionBumps: Array.isArray(rawBumps) ? (rawBumps as VersionBump[]) : [],
         summary: typeof p.summary === "string" ? p.summary : "Plan parsed",
       };
+
+      // Fix 4: Filter out moves where the source file has repo-specific imports
+      const repoSpecificPatterns = [
+        /@king-studios-rbx\/anime-reborn-(?!common|types|utils|assets)/,
+        /from ['"]src\/client\//,
+        /from ['"]src\/server\//,
+        /@rbxts\/vide/,
+      ];
+      plan.filesToMove = plan.filesToMove.filter(move => {
+        const content = candidateContents.get(move.path);
+        if (!content) return true;
+        const isSpecific = repoSpecificPatterns.some(pat => pat.test(content));
+        if (isSpecific) log(`  ⚠️  Skipping ${move.path} — has repo-specific imports`);
+        return !isSpecific;
+      });
+
+      return plan;
     }
   } catch {
     // log raw for debugging
@@ -567,6 +592,60 @@ async function executePlanVariant(
     }
   }
 
+  // ── Fix 5: Verify stale imports ─────────────────────────────────────────────
+  // After updating imports, check no .ts files in source repos still import old paths
+  if (!variant.skipImports) {
+    for (const move of plan.filesToMove) {
+      const fromRepo = resolveRepo(move.fromRepo);
+      const toRepo = resolveRepo(move.toRepo);
+      if (!fromRepo || !toRepo || fromRepo === toRepo) continue;
+      const fromDir = clonedDirs.get(fromRepo)!;
+      const baseName = move.path.replace(/\.[jt]sx?$/, "").split("/").pop() ?? "";
+      if (!baseName) continue;
+      const staleMatches = await scanImportsForMovedFile(fromDir, move.path);
+      if (staleMatches.length === 0) {
+        log(`  ✅ No stale imports found for ${baseName}`);
+      } else {
+        log(`  ⚠️  Still found ${staleMatches.length} file${staleMatches.length !== 1 ? "s" : ""} importing old path for ${baseName}`);
+      }
+    }
+  }
+
+  // ── Fix 6: Update barrel re-exports ──────────────────────────────────────────
+  // If source repo has barrel files that re-export moved files, update them to the new package
+  if (!variant.skipImports) {
+    const barrelPaths = ["src/shared/utils/index.ts", "src/shared/index.ts", "src/index.ts"];
+    for (const move of plan.filesToMove) {
+      const fromRepo = resolveRepo(move.fromRepo);
+      const toRepo = resolveRepo(move.toRepo);
+      if (!fromRepo || !toRepo || fromRepo === toRepo) continue;
+      const fromDir = clonedDirs.get(fromRepo)!;
+      const toDir = clonedDirs.get(toRepo)!;
+
+      const toPkgRaw = await readRepoFile(toDir, "package.json").catch(() => null);
+      let barrelTargetPkg: string | null = null;
+      if (toPkgRaw) {
+        try { barrelTargetPkg = (JSON.parse(toPkgRaw) as { name?: string }).name ?? null; } catch { /* ignore */ }
+      }
+      if (!barrelTargetPkg) continue;
+
+      const barrelBaseName = move.path.replace(/\.[jt]sx?$/, "").split("/").pop()!;
+      for (const barrelPath of barrelPaths) {
+        const content = await readRepoFile(fromDir, barrelPath);
+        if (!content) continue;
+        const updated = content.replace(
+          new RegExp(`export \\* from ['"]\\./[^'"]*${barrelBaseName}['"]`, "g"),
+          `export * from "${barrelTargetPkg}/${barrelBaseName}"`
+        );
+        if (updated !== content) {
+          await writeRepoFile(fromDir, barrelPath, updated);
+          result.importUpdateCount++;
+          log(`  📦 Updated barrel: ${barrelPath}`);
+        }
+      }
+    }
+  }
+
   // Apply version bumps (v3 only)
   if (variant.applyVersionBumps) {
     for (const bump of plan.versionBumps) {
@@ -590,6 +669,10 @@ async function executePlanVariant(
       const tscLines: string[] = [];
       for (const repo of result.reposWithChanges) {
         const dir = clonedDirs.get(repo)!;
+        // Install deps before tsc so type imports resolve correctly
+        try {
+          await execAsync("bun install --frozen-lockfile 2>&1 || bun install 2>&1", { cwd: dir });
+        } catch { /* non-fatal */ }
         const tscResult = await runTsc(dir);
         totalErrors += tscResult.errorCount;
         tscLines.push(...tscResult.errors.map((e) => `${e.file}:${e.line}:${e.col} - ${e.message}`));
@@ -597,8 +680,28 @@ async function executePlanVariant(
       result.tscErrors = totalErrors;
       result.tscOutput = tscLines.join("\n");
       // Score: 2 pts if all pass, 1 pt if partial (<5 errors), 0 if more
-      if (totalErrors === 0) result.score = 2;
-      else if (totalErrors < 5) result.score = 1;
+      if (totalErrors === 0) {
+        // tsc passed — also run bun test to confirm tests still green
+        let testFailed = false;
+        let totalFailCount = 0;
+        for (const repo of result.reposWithChanges) {
+          const dir = clonedDirs.get(repo)!;
+          try {
+            await execAsync("bun test 2>&1", { cwd: dir });
+            log(`  🧪 bun test: passed (${repoShortName(repo)})`);
+          } catch (testErr) {
+            testFailed = true;
+            const out = (testErr instanceof Error
+              ? ((testErr as Error & { stdout?: string }).stdout ?? testErr.message)
+              : String(testErr));
+            const m = out.match(/(\d+)\s+fail/i);
+            const failCount = m ? parseInt(m[1]) : 1;
+            totalFailCount += failCount;
+            log(`  🧪 bun test: FAILED (${failCount} failures in ${repoShortName(repo)})`);
+          }
+        }
+        result.score = testFailed ? 1 : 2;
+      } else if (totalErrors < 5) result.score = 1;
       else result.score = 0;
     } else {
       // No tsc available — default to 1 (neutral, not penalized)
@@ -689,7 +792,15 @@ export async function runRefactor(opts: RefactorOptions): Promise<void> {
 
   // ── Step 3a: Pass 1 — identify candidate files (no raw content) ──────────
   log("\n🔍 Step 3a: Pass 1 — identifying candidate files (map-only)...");
-  const candidates = await identifyCandidates(structures, repoMaps, goal, language);
+  const rawCandidates = await identifyCandidates(structures, repoMaps, goal, language);
+
+  // Fix 3: Filter out candidates that already exist in the target repo
+  const targetTree = structures[structures.length - 1].tree;
+  const candidates = rawCandidates.filter(path => !targetTree.includes(path));
+  const filteredByTarget = rawCandidates.length - candidates.length;
+  if (filteredByTarget > 0) {
+    log(`  🔍 Filtered ${filteredByTarget} candidates already present in target repo`);
+  }
 
   if (candidates.length === 0) {
     log("\n⚠️  Pass 1 found no candidate files. Refactor complete (nothing to do).");
@@ -731,9 +842,6 @@ export async function runRefactor(opts: RefactorOptions): Promise<void> {
   // We need separate clonedDirs for each variant (clone again into variant-specific dirs)
   // For simplicity, we create variant copies by cloning fresh for each — or reuse with temp dirs.
   // Strategy: clone 3 separate copies (v1, v2, v3) from the first clone via cp.
-  const { exec: cpExec } = await import("child_process");
-  const { promisify } = await import("util");
-  const execAsync = promisify(cpExec);
 
   const variants: BranchVariant[] = [
     { variant: "v1", branchName: `arkos/refactor-${timestamp}-v1`, skipImports: false, applyVersionBumps: false },
