@@ -254,7 +254,8 @@ function extractServiceNames(data: RepoData): Map<string, string> {
 
 async function detectServiceGaps(
   targetData: RepoData,
-  referenceData: RepoData
+  referenceData: RepoData,
+  depDataList: RepoData[] = []
 ): Promise<TodoItem[]> {
   const todos: TodoItem[] = [];
 
@@ -291,31 +292,41 @@ async function detectServiceGaps(
 
   const targetServices = extractServiceNames(targetData);
 
+  // Build an index of interface dep files by basename (src/props/ and src/apps/)
+  // to detect controllers already covered by the interface package.
+  const interfaceDep = depDataList.find((d) =>
+    d.ownerRepo.toLowerCase().includes("interface")
+  );
+  const interfaceBasenames = new Set<string>();
+  if (interfaceDep) {
+    for (const f of interfaceDep.map.files) {
+      if (f.path.startsWith("src/props/") || f.path.startsWith("src/apps/")) {
+        interfaceBasenames.add(basename(f.path, extname(f.path)).toLowerCase());
+      }
+    }
+  }
+
   // service_missing: in reference but not target
   for (const [name, refPath] of refServices) {
     if (!targetServices.has(name)) {
-      // Interface controllers may already be handled by the interface package
-      const isInterfaceController =
-        refPath.includes("src/client/controllers/interface/") ||
-        refPath.includes("src/client/controllers/ui/") ||
-        /\/(hide_hud|store|hotbar|summon|hud)/.test(refPath);
+      // Check if this is an interface prop/app controller already handled by the package
+      const isInterfacePropPath =
+        refPath.includes("src/client/controllers/interface/props/") ||
+        refPath.includes("src/client/controllers/interface/app/");
 
-      const description = isInterfaceController
-        ? `${refPath} exists in the reference repo but has no counterpart in the target. May already be handled by @king-studios-rbx/anime-reborn-interface package — verify before implementing.`
-        : `${refPath} exists in the reference repo but has no counterpart in the target. This service needs to be created or ported.`;
-
-      const suggestedChange = isInterfaceController
-        ? `Verify whether @king-studios-rbx/anime-reborn-interface already covers this, then port or create a counterpart to ${refPath} if needed`
-        : `Port or create a counterpart to ${refPath} in the target repo`;
+      if (isInterfacePropPath && interfaceBasenames.has(name)) {
+        // Already covered by @king-studios-rbx/anime-reborn-interface — skip
+        continue;
+      }
 
       todos.push({
         id: makeId("service_missing", name),
         type: "service_missing",
         priority: "medium", // lowered from high — many reference items are false positives
         title: `Missing service/controller: ${name}`,
-        description,
+        description: `${refPath} exists in the reference repo but has no counterpart in the target. This service needs to be created or ported.`,
         referenceFile: refPath,
-        suggestedChange,
+        suggestedChange: `Port or create a counterpart to ${refPath} in the target repo`,
         estimatedComplexity: "moderate",
       });
     }
@@ -434,6 +445,8 @@ function isNonImportedDep(pkgName: string): boolean {
   if (pkgName === "@rbxts/compiler-types" || pkgName === "@rbxts/types") return true;
   if (pkgName === "@king-studios-rbx/types") return true;
   if (pkgName.startsWith("@types/")) return true;
+  // Reactive state lib — used at runtime via module side-effects, not always directly imported
+  if (pkgName === "@rbxts/charm") return true;
   // Generic tooling
   if (pkgName === "bun" || pkgName === "prettier" || pkgName === "eslint") return true;
   return false;
@@ -630,7 +643,7 @@ export async function runFinalizeAnalyze(opts: FinalizeOptions): Promise<void> {
   let serviceGapTodos: TodoItem[] = [];
   if (referenceData) {
     console.log("🔎 Detecting service/controller gaps...");
-    serviceGapTodos = await detectServiceGaps(targetData, referenceData);
+    serviceGapTodos = await detectServiceGaps(targetData, referenceData, depDataList);
   }
 
   // Step 5: Networking issues

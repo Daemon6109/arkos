@@ -6,6 +6,7 @@ import { getStats } from "./memory/index.js";
 import { startServer } from "./server/index.js";
 import { runRefactor } from "./refactor/index.js";
 import { runFinalizeAnalyze } from "./finalize/index.js";
+import { runFinalizeExecutor } from "./finalize/executor.js";
 
 const args = process.argv.slice(2);
 
@@ -23,6 +24,12 @@ Usage:
     --target <owner/repo>                   Repo to finalize
     --reference <owner/repo>                Reference repo to compare against
     --deps <owner/repo>...                  Dependency repos (space-separated)
+  arkos finalize execute                    Process import_cleanup todos and open a PR
+    --target <owner/repo>                   Repo to apply changes to
+    [--types import_cleanup]                Todo types to process (default: import_cleanup)
+    [--dry-run]                             Preview what would happen without writing
+    [--no-pr]                               Push branch but don't open a PR
+    [--max N]                               Process at most N items
   arkos serve                               Start HTTP API server (port 3847)
   arkos serve --port 8080                   Start on custom port
   arkos status                              Show memory stats
@@ -111,39 +118,77 @@ if (command === "run") {
   });
 } else if (command === "finalize") {
   const subcommand = args[1];
-  if (subcommand !== "analyze") {
+
+  if (subcommand === "analyze") {
+    const targetIdx = args.indexOf("--target");
+    if (targetIdx === -1 || !args[targetIdx + 1]) {
+      console.error("Error: --target is required");
+      console.error("  arkos finalize analyze --target King-Studios-RBX/Anime-Reborn-Lobby");
+      process.exit(1);
+    }
+    const target = args[targetIdx + 1]!;
+
+    const refIdx = args.indexOf("--reference");
+    const reference = refIdx !== -1 ? args[refIdx + 1] : undefined;
+
+    // --deps: collect all values after --deps until next --flag
+    const depsIdx = args.indexOf("--deps");
+    const deps: string[] = [];
+    if (depsIdx !== -1) {
+      for (let i = depsIdx + 1; i < args.length; i++) {
+        if (args[i]!.startsWith("--")) break;
+        deps.push(args[i]!);
+      }
+    }
+
+    const verbose = args.includes("-v") || args.includes("--verbose");
+
+    runFinalizeAnalyze({ target, reference, deps, analyzeOnly: true, verbose }).catch((err) => {
+      console.error("Arkos finalize error:", err);
+      process.exit(1);
+    });
+  } else if (subcommand === "execute") {
+    const targetIdx = args.indexOf("--target");
+    if (targetIdx === -1 || !args[targetIdx + 1]) {
+      console.error("Error: --target is required");
+      console.error("  arkos finalize execute --target King-Studios-RBX/Anime-Reborn-Lobby");
+      process.exit(1);
+    }
+    const target = args[targetIdx + 1]!;
+
+    // --types: collect values after --types until next --flag
+    const typesIdx = args.indexOf("--types");
+    const types: string[] = [];
+    if (typesIdx !== -1) {
+      for (let i = typesIdx + 1; i < args.length; i++) {
+        if (args[i]!.startsWith("--")) break;
+        types.push(args[i]!);
+      }
+    }
+
+    // --max N
+    const maxIdx = args.indexOf("--max");
+    const maxItems = maxIdx !== -1 && args[maxIdx + 1] ? parseInt(args[maxIdx + 1]!, 10) : undefined;
+
+    const dryRun = args.includes("--dry-run");
+    const noPR = args.includes("--no-pr");
+
+    runFinalizeExecutor({
+      targetRepo: target,
+      types: types.length > 0 ? (types as import("./finalize/types.js").TodoType[]) : undefined,
+      dryRun,
+      noPR,
+      maxItems,
+    }).catch((err) => {
+      console.error("Arkos finalize execute error:", err);
+      process.exit(1);
+    });
+  } else {
     console.error(`Unknown finalize subcommand: ${subcommand ?? "(none)"}`);
     console.error("  arkos finalize analyze --target <owner/repo> [--reference <owner/repo>] [--deps <owner/repo>...]");
+    console.error("  arkos finalize execute --target <owner/repo> [--types import_cleanup] [--dry-run] [--no-pr] [--max N]");
     process.exit(1);
   }
-
-  const targetIdx = args.indexOf("--target");
-  if (targetIdx === -1 || !args[targetIdx + 1]) {
-    console.error("Error: --target is required");
-    console.error("  arkos finalize analyze --target King-Studios-RBX/Anime-Reborn-Lobby");
-    process.exit(1);
-  }
-  const target = args[targetIdx + 1]!;
-
-  const refIdx = args.indexOf("--reference");
-  const reference = refIdx !== -1 ? args[refIdx + 1] : undefined;
-
-  // --deps: collect all values after --deps until next --flag
-  const depsIdx = args.indexOf("--deps");
-  const deps: string[] = [];
-  if (depsIdx !== -1) {
-    for (let i = depsIdx + 1; i < args.length; i++) {
-      if (args[i]!.startsWith("--")) break;
-      deps.push(args[i]!);
-    }
-  }
-
-  const verbose = args.includes("-v") || args.includes("--verbose");
-
-  runFinalizeAnalyze({ target, reference, deps, analyzeOnly: true, verbose }).catch((err) => {
-    console.error("Arkos finalize error:", err);
-    process.exit(1);
-  });
 } else if (command === "serve") {
   const portIdx = args.indexOf("--port");
   const port = portIdx !== -1 ? parseInt(args[portIdx + 1], 10) : 3847;
