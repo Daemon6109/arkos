@@ -13,6 +13,7 @@ import {
 import { buildRepoMap, formatRepoMap, type RepoMap } from "../tools/repo_map.js";
 import { generate, parseJsonSafe } from "../ollama.js";
 import { join } from "path";
+import { readdir, readFile } from "fs/promises";
 import { storeRefactorLesson, getRefactorLessons } from "../memory/index.js";
 
 // Lazy-load tsc_checker so it degrades gracefully if not present
@@ -71,6 +72,71 @@ interface CandidateList {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Normalize a FileToMove object — handles alternate field names models use */
+function normalizeFileToMove(raw: Record<string, unknown>): FileToMove {
+  return {
+    fromRepo: String(raw.fromRepo ?? raw.from_repo ?? raw.source ?? raw.sourceRepo ?? ""),
+    path: String(raw.path ?? raw.sourcePath ?? raw.from ?? raw.source_path ?? ""),
+    toRepo: String(raw.toRepo ?? raw.to_repo ?? raw.target ?? raw.targetRepo ?? raw.destinationRepo ?? ""),
+    targetPath: String(raw.targetPath ?? raw.target_path ?? raw.to ?? raw.destination ?? raw.destinationPath ?? raw.path ?? ""),
+    reason: String(raw.reason ?? raw.description ?? raw.why ?? ""),
+  };
+}
+
+/** Normalize an ImportToUpdate object */
+function normalizeImportToUpdate(raw: Record<string, unknown>): ImportToUpdate {
+  return {
+    repo: String(raw.repo ?? raw.repository ?? ""),
+    file: String(raw.file ?? raw.filePath ?? raw.path ?? ""),
+    oldImport: String(raw.oldImport ?? raw.old ?? raw.from ?? raw.before ?? ""),
+    newImport: String(raw.newImport ?? raw.new ?? raw.to ?? raw.after ?? raw.replacement ?? ""),
+  };
+}
+
+/**
+ * Deterministic import scanner — finds all TS/JS files in a repo that import
+ * a moved file path and returns the files + line numbers to patch.
+ * This replaces the model-generated importsToUpdate (which often gets paths wrong).
+ */
+async function scanImportsForMovedFile(
+  repoDir: string,
+  movedPath: string, // e.g. "src/shared/utils/server_time.ts"
+): Promise<Array<{ file: string; matchedImport: string }>> {
+  const results: Array<{ file: string; matchedImport: string }> = [];
+
+  // The import path could be relative OR via path alias — we search for the basename
+  const baseName = movedPath.replace(/\.[jt]sx?$/, "").split("/").pop() ?? "";
+  if (!baseName) return results;
+
+  // Walk all TS files in the repo
+  async function walk(dir: string): Promise<string[]> {
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    const files: string[] = [];
+    for (const e of entries) {
+      if (e.name === "node_modules" || e.name === "dist" || e.name === ".git") continue;
+      const full = join(dir, e.name);
+      if (e.isDirectory()) files.push(...await walk(full));
+      else if (/\.[jt]sx?$/.test(e.name)) files.push(full);
+    }
+    return files;
+  }
+
+  const allFiles = await walk(repoDir);
+  for (const filePath of allFiles) {
+    const content = await readFile(filePath, "utf8").catch(() => "");
+    // Match any import/require that ends with the moved file basename
+    const importRegex = new RegExp(`from\\s+['"]([^'"]*/${baseName})['"]|require\\(['"]([^'"]*/${baseName})['"]\\)`, "g");
+    let match: RegExpExecArray | null;
+    while ((match = importRegex.exec(content)) !== null) {
+      const matchedImport = match[1] ?? match[2];
+      if (matchedImport) {
+        results.push({ file: filePath.replace(repoDir + "/", ""), matchedImport });
+      }
+    }
+  }
+  return results;
+}
 
 function log(msg: string) {
   console.log(msg);
@@ -223,7 +289,9 @@ ${fileContentParts.join("\n\n")}
 TARGET REPO STRUCTURE (${targetStructure.ownerRepo}):
 ${targetStructure.tree}
 
-REPO SHORT NAMES: ${structures.map((s, i) => `REPO ${i + 1} = "${repoShortName(s.ownerRepo)}"`).join(", ")}
+REPO SHORT NAMES: ${structures.map((s, i) => `REPO ${i + 1} = "${repoShortName(s.ownerRepo)}" (npm package: ${(s.packageJson as { name?: string })?.name ?? "unknown"})`).join(", ")}
+
+IMPORTANT: When specifying newImport values, use the EXACT npm package names listed above. Do NOT invent package names.
 
 Based on the goal and file contents, output a refactor plan. Use only the short repo names (without owner) in all fields.
 
@@ -270,11 +338,19 @@ Respond ONLY with valid JSON (no markdown, no extra text):
   try {
     const parsed = JSON.parse(clean2) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const p = parsed as Partial<RefactorPlan>;
+      const p = parsed as Record<string, unknown>;
+      const rawMoves = Array.isArray(p.filesToMove) ? p.filesToMove : [];
+      const rawImports = Array.isArray(p.importsToUpdate) ? p.importsToUpdate : [];
+      const rawBumps = Array.isArray(p.versionBumps) ? p.versionBumps : [];
       return {
-        filesToMove: Array.isArray(p.filesToMove) ? p.filesToMove : [],
-        importsToUpdate: Array.isArray(p.importsToUpdate) ? p.importsToUpdate : [],
-        versionBumps: Array.isArray(p.versionBumps) ? p.versionBumps : [],
+        filesToMove: rawMoves
+          .filter((m): m is Record<string, unknown> => typeof m === "object" && m !== null)
+          .map(normalizeFileToMove)
+          .filter((m) => m.path && m.targetPath),
+        importsToUpdate: rawImports
+          .filter((i): i is Record<string, unknown> => typeof i === "object" && i !== null)
+          .map(normalizeImportToUpdate),
+        versionBumps: Array.isArray(rawBumps) ? (rawBumps as VersionBump[]) : [],
         summary: typeof p.summary === "string" ? p.summary : "Plan parsed",
       };
     }
@@ -426,18 +502,67 @@ async function executePlanVariant(
   }
 
   // Update imports (unless conservative/skipImports)
+  // Strategy: deterministic grep-scan on all moved files, then also apply model-suggested updates
   if (!variant.skipImports) {
+    // 1. Deterministic scan: for each moved file, find any file in the SOURCE repo that imports it
+    for (const move of plan.filesToMove) {
+      const fromRepo = resolveRepo(move.fromRepo);
+      const toRepo = resolveRepo(move.toRepo);
+      if (!fromRepo || !toRepo || fromRepo === toRepo) continue;
+      const fromDir = clonedDirs.get(fromRepo)!;
+
+      // Get the target package name from package.json in the target repo
+      const toDir = clonedDirs.get(toRepo)!;
+      const toPkg = await readRepoFile(toDir, "package.json").catch(() => null);
+      let targetPkgName: string | null = null;
+      if (toPkg) {
+        try { targetPkgName = (JSON.parse(toPkg) as { name?: string }).name ?? null; } catch { /* ignore */ }
+      }
+
+      const matches = await scanImportsForMovedFile(fromDir, move.path);
+      for (const { file, matchedImport } of matches) {
+        const content = await readRepoFile(fromDir, file);
+        if (!content) continue;
+
+        // If we know the target package name, rewrite to package import
+        let newImport: string;
+        if (targetPkgName) {
+          // e.g. "@king-studios-rbx/utils" + strip "src/" prefix from targetPath
+          const exportPath = move.targetPath
+            .replace(/^(src|packages\/[^/]+\/src)\//, "")
+            .replace(/\.[jt]sx?$/, "");
+          newImport = `${targetPkgName}/${exportPath}`;
+        } else {
+          // Fallback: keep relative but adjust depth
+          newImport = matchedImport.replace(/[^/]+$/, move.targetPath.split("/").pop()!.replace(/\.[jt]sx?$/, ""));
+        }
+
+        const updated = content.replace(
+          new RegExp(`(['"])${matchedImport.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(['"])`, "g"),
+          `$1${newImport}$2`
+        );
+        if (updated !== content) {
+          await writeRepoFile(fromDir, file, updated);
+          result.modifiedFiles.push({ repoDir: fromDir, path: file, repoName: repoShortName(fromRepo) });
+          result.importUpdateCount++;
+        }
+      }
+    }
+
+    // 2. Also apply model-suggested updates (as fallback / for same-repo refactors)
     for (const imp of plan.importsToUpdate) {
       const repo = resolveRepo(imp.repo);
       if (!repo) continue;
       const dir = clonedDirs.get(repo)!;
       const content = await readRepoFile(dir, imp.file);
       if (!content) continue;
-      if (content.includes(imp.oldImport)) {
+      if (imp.oldImport && content.includes(imp.oldImport)) {
         const updated = content.split(imp.oldImport).join(imp.newImport);
-        await writeRepoFile(dir, imp.file, updated);
-        result.modifiedFiles.push({ repoDir: dir, path: imp.file, repoName: repoShortName(repo) });
-        result.importUpdateCount++;
+        if (updated !== content) {
+          await writeRepoFile(dir, imp.file, updated);
+          result.modifiedFiles.push({ repoDir: dir, path: imp.file, repoName: repoShortName(repo) });
+          result.importUpdateCount++;
+        }
       }
     }
   }
