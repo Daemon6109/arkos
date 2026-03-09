@@ -225,23 +225,18 @@ export async function runFinalizeExecutor(opts: ExecutorOptions): Promise<void> 
     console.warn(`⚠️  bun install warning: ${err}`);
   }
 
-  // Check if critical private packages were actually installed
-  const criticalPkgDir = join(cloneDir, "node_modules", "@king-studios-rbx");
-  const criticalInstalled = existsSync(criticalPkgDir);
-  if (!criticalInstalled) {
-    console.warn("⚠️  Private packages not installed — tsc may not fully validate external imports");
-    console.warn("    Set GITHUB_TOKEN env var for GitHub Package Registry auth");
-
-    // Verify all rewritten imports are actually resolvable — if any @king-studios-rbx
-    // package is missing from node_modules, tsc can't validate it, so abort the PR.
-    for (const { file, to: pkgName } of importUpdates) {
-      const pkgDir = join(cloneDir, "node_modules", pkgName.split("/").slice(0, 2).join("/"));
-      if (!existsSync(pkgDir)) {
-        console.error(`❌ Import rewritten to "${pkgName}" but package not in node_modules`);
-        console.error(`   Cannot validate — aborting PR`);
-        await execAsync("git checkout -- .", { cwd: cloneDir });
-        return;
-      }
+  // Always verify each specific package that imports were rewritten to is actually installed.
+  // Checking the scope dir (@king-studios-rbx) is not enough — some packages in the scope
+  // may be cached while others (private) failed to install.
+  for (const update of importUpdates) {
+    const pkgName = update.to;
+    const pkgDir = join(cloneDir, "node_modules", pkgName.split("/").slice(0, 2).join("/"));
+    if (!existsSync(pkgDir)) {
+      console.error(`❌ "${pkgName}" not in node_modules — bun install may need GITHUB_TOKEN`);
+      console.error(`   Cannot validate changes — aborting PR`);
+      console.error(`   Run: export GITHUB_TOKEN=<token> && source ~/.arkos/.env before executing`);
+      await execAsync("git checkout -- .", { cwd: cloneDir });
+      return;
     }
   }
 
