@@ -471,11 +471,45 @@ interface BranchResult {
   importUpdateCount: number;
 }
 
+/**
+ * Find the most specific package.json for a target file path.
+ * Handles monorepos by scanning packages/\/\* and src/\/\* sub-packages before falling back to root.
+ */
+async function findTargetPackage(repoDir: string, targetPath: string): Promise<{ name: string; srcRoot: string } | null> {
+  // Try sub-packages first: packages/*/package.json, src/*/package.json
+  for (const pattern of ["packages", "src"]) {
+    const patternDir = join(repoDir, pattern);
+    const entries = await readdir(patternDir, { withFileTypes: true }).catch(() => []);
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const pkgFile = join(patternDir, e.name, "package.json");
+      const pkgContent = await readFile(pkgFile, "utf8").catch(() => null);
+      if (!pkgContent) continue;
+      try {
+        const pkg = JSON.parse(pkgContent) as { name?: string };
+        const srcRoot = `${pattern}/${e.name}/src/`;
+        if (targetPath.startsWith(srcRoot) && pkg.name) {
+          return { name: pkg.name, srcRoot };
+        }
+      } catch { continue; }
+    }
+  }
+  // Fall back to root package.json
+  const rootContent = await readFile(join(repoDir, "package.json"), "utf8").catch(() => null);
+  if (rootContent) {
+    try {
+      const pkg = JSON.parse(rootContent) as { name?: string };
+      if (pkg.name) return { name: pkg.name, srcRoot: "src/" };
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
 /** Execute a single variant of the refactor plan on a set of cloned dirs */
 async function executePlanVariant(
   variant: BranchVariant,
   plan: RefactorPlan,
-  clonedDirs: Map<string, string>, // NOTE: must be variant-specific dirs (vDirs), not original clonedDirs
+  workingDirs: Map<string, string>, // variant-specific dirs (vDirs), NOT the original clonedDirs
   resolveRepo: (nameOrOwner: string) => string | undefined,
   language: string,
   goal: string,
@@ -515,7 +549,7 @@ async function executePlanVariant(
 
   // Create branches
   for (const repo of result.reposWithChanges) {
-    const dir = clonedDirs.get(repo)!;
+    const dir = workingDirs.get(repo)!;
     await createBranch(dir, variant.branchName);
   }
 
@@ -525,8 +559,8 @@ async function executePlanVariant(
     const toRepo = resolveRepo(move.toRepo);
     if (!fromRepo || !toRepo) continue;
 
-    const fromDir = clonedDirs.get(fromRepo)!;
-    const toDir = clonedDirs.get(toRepo)!;
+    const fromDir = workingDirs.get(fromRepo)!;
+    const toDir = workingDirs.get(toRepo)!;
     const content = await readRepoFile(fromDir, move.path);
     if (!content) continue;
 
@@ -544,15 +578,14 @@ async function executePlanVariant(
       const fromRepo = resolveRepo(move.fromRepo);
       const toRepo = resolveRepo(move.toRepo);
       if (!fromRepo || !toRepo || fromRepo === toRepo) continue;
-      const fromDir = clonedDirs.get(fromRepo)!;
+      const fromDir = workingDirs.get(fromRepo)!;
 
-      // Get the target package name from package.json in the target repo
-      const toDir = clonedDirs.get(toRepo)!;
-      const toPkg = await readRepoFile(toDir, "package.json").catch(() => null);
-      let targetPkgName: string | null = null;
-      if (toPkg) {
-        try { targetPkgName = (JSON.parse(toPkg) as { name?: string }).name ?? null; } catch { /* ignore */ }
-      }
+      // Get the target package name — use sub-package lookup to handle monorepos correctly
+      // e.g. targetPath="packages/utils/src/server_time.ts" → name="@king-studios-rbx/utils"
+      const toDir = workingDirs.get(toRepo)!;
+      const pkgInfo = await findTargetPackage(toDir, move.targetPath);
+      const targetPkgName = pkgInfo?.name ?? null;
+      const targetSrcRoot = pkgInfo?.srcRoot ?? "src/";
 
       const matches = await scanImportsForMovedFile(fromDir, move.path);
       for (const { file, matchedImport } of matches) {
@@ -562,9 +595,10 @@ async function executePlanVariant(
         // If we know the target package name, rewrite to package import
         let newImport: string;
         if (targetPkgName) {
-          // e.g. "@king-studios-rbx/utils" + strip "src/" prefix from targetPath
+          // Build the export path by stripping the sub-package src root
+          // e.g. "packages/utils/src/server_time.ts" → "server_time" → "@king-studios-rbx/utils/server_time"
           const exportPath = move.targetPath
-            .replace(/^(src|packages\/[^/]+\/src)\//, "")
+            .replace(new RegExp(`^${targetSrcRoot.replace(/\//g, "\\/")}`), "")
             .replace(/\.[jt]sx?$/, "");
           newImport = `${targetPkgName}/${exportPath}`;
         } else {
@@ -588,7 +622,7 @@ async function executePlanVariant(
     for (const imp of plan.importsToUpdate) {
       const repo = resolveRepo(imp.repo);
       if (!repo) continue;
-      const dir = clonedDirs.get(repo)!;
+      const dir = workingDirs.get(repo)!;
       const content = await readRepoFile(dir, imp.file);
       if (!content) continue;
       if (imp.oldImport && content.includes(imp.oldImport)) {
@@ -604,14 +638,14 @@ async function executePlanVariant(
 
   // ── Fix 5: Verify stale imports ─────────────────────────────────────────────
   // After updating imports, check no .ts files in source repos still import old paths.
-  // IMPORTANT: clonedDirs here is the variant-specific vDirs (not original clones), so we
+  // IMPORTANT: workingDirs here is the variant-specific vDirs (not original clones), so we
   // correctly read the post-edit state of the variant working tree.
   if (!variant.skipImports) {
     for (const move of plan.filesToMove) {
       const fromRepo = resolveRepo(move.fromRepo);
       const toRepo = resolveRepo(move.toRepo);
       if (!fromRepo || !toRepo || fromRepo === toRepo) continue;
-      const fromDir = clonedDirs.get(fromRepo)!; // variant-specific dir — reads updated files
+      const fromDir = workingDirs.get(fromRepo)!; // variant-specific dir — reads updated files
       const baseName = move.path.replace(/\.[jt]sx?$/, "").split("/").pop() ?? "";
       if (!baseName) continue;
       const staleMatches = await scanImportsForMovedFile(fromDir, move.path);
@@ -631,8 +665,8 @@ async function executePlanVariant(
       const fromRepo = resolveRepo(move.fromRepo);
       const toRepo = resolveRepo(move.toRepo);
       if (!fromRepo || !toRepo || fromRepo === toRepo) continue;
-      const fromDir = clonedDirs.get(fromRepo)!;
-      const toDir = clonedDirs.get(toRepo)!;
+      const fromDir = workingDirs.get(fromRepo)!;
+      const toDir = workingDirs.get(toRepo)!;
 
       const toPkgRaw = await readRepoFile(toDir, "package.json").catch(() => null);
       let barrelTargetPkg: string | null = null;
@@ -663,7 +697,7 @@ async function executePlanVariant(
     for (const bump of plan.versionBumps) {
       const repo = resolveRepo(bump.repo);
       if (!repo) continue;
-      const dir = clonedDirs.get(repo)!;
+      const dir = workingDirs.get(repo)!;
       const content = await readRepoFile(dir, bump.packagePath);
       if (!content) continue;
       try {
@@ -680,7 +714,7 @@ async function executePlanVariant(
       let totalErrors = 0;
       const tscLines: string[] = [];
       for (const repo of result.reposWithChanges) {
-        const dir = clonedDirs.get(repo)!;
+        const dir = workingDirs.get(repo)!;
         // Install deps before tsc so type imports resolve correctly
         try {
           await execAsync("bun install --frozen-lockfile 2>&1 || bun install 2>&1", { cwd: dir });
@@ -696,7 +730,7 @@ async function executePlanVariant(
         // tsc passed — also run bun test, but only count NEW failures above baseline
         let variantTestsFailed = false;
         for (const repo of result.reposWithChanges) {
-          const dir = clonedDirs.get(repo)!;
+          const dir = workingDirs.get(repo)!;
           const testOut = await execAsync("bun test 2>&1", { cwd: dir, timeout: 60000 }).catch(
             (e: unknown) => ({
               stdout: (e as { stdout?: string }).stdout ?? "",
@@ -1039,6 +1073,7 @@ export async function runRefactor(opts: RefactorOptions): Promise<void> {
         ? `\n**Version bumps:**\n${repoBumps.map((b) => `- \`${b.packagePath}\`: ${b.field} = ${b.newValue}`).join("\n")}`
         : "";
 
+      log(`  🔍 Debug: winnerVariant="${winnerVariant}" score=${winnerScore}`);
       const prBody = `## Arkos Refactor
 
 **Goal:** ${goal}
