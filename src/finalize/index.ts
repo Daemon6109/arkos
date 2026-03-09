@@ -3,7 +3,7 @@
 // dep packages to produce a structured TODO list of issues to fix.
 
 import { readFile, mkdir } from "fs/promises";
-import { join, basename, extname } from "path";
+import { join, basename, extname, dirname } from "path";
 import { homedir } from "os";
 import { cloneRepo } from "../tools/git.js";
 import { buildRepoMap, type RepoMap } from "../tools/repo_map.js";
@@ -142,6 +142,13 @@ async function findDepPackageForFile(
   return pkgNameFromRepo(depData.ownerRepo);
 }
 
+// Basenames too generic to match reliably by name alone.
+// For these, we require a stronger match: the dep must have a file
+// in a directory of the same name as the local file's parent directory.
+const GENERIC_BASENAMES = new Set([
+  "index", "utils", "helpers", "types", "constants", "common", "shared",
+]);
+
 async function detectImportCleanup(
   targetData: RepoData,
   depDataList: RepoData[]
@@ -150,12 +157,24 @@ async function detectImportCleanup(
 
   // Build multi-map: basename → all dep file matches (to check ALL deps, not just first)
   const depFileIndex = new Map<string, Array<{ depData: RepoData; relPath: string }>>();
+  // Build suffix index for generic basename matching: "parentDirName/basename" → matches
+  const depSuffixIndex = new Map<string, Array<{ depData: RepoData; relPath: string }>>();
+
   for (const depData of depDataList) {
     for (const f of depData.map.files) {
       const b = basename(f.path, extname(f.path)).toLowerCase();
+      const parentDir = basename(dirname(f.path)).toLowerCase();
+
+      // Normal basename index
       const existing = depFileIndex.get(b) ?? [];
       existing.push({ depData, relPath: f.path });
       depFileIndex.set(b, existing);
+
+      // Suffix index: "parentDir/basename"
+      const suffix = `${parentDir}/${b}`;
+      const existingSuffix = depSuffixIndex.get(suffix) ?? [];
+      existingSuffix.push({ depData, relPath: f.path });
+      depSuffixIndex.set(suffix, existingSuffix);
     }
   }
 
@@ -166,7 +185,20 @@ async function detectImportCleanup(
 
   for (const uf of utilFiles) {
     const b = basename(uf.path, extname(uf.path)).toLowerCase();
-    const allMatches = depFileIndex.get(b) ?? [];
+
+    let allMatches: Array<{ depData: RepoData; relPath: string }>;
+
+    if (GENERIC_BASENAMES.has(b)) {
+      // For generic basenames (especially "index"), match by parent directory name.
+      // E.g., "lighting/index.ts" must find a dep file with parentDir "lighting".
+      const parentDir = basename(dirname(uf.path)).toLowerCase();
+      const suffix = `${parentDir}/${b}`;
+      allMatches = depSuffixIndex.get(suffix) ?? [];
+      // If no dep has a file in the same-named parent dir, skip entirely
+      if (allMatches.length === 0) continue;
+    } else {
+      allMatches = depFileIndex.get(b) ?? [];
+    }
 
     // Score all matches and filter out bad ones (interface/assets packages)
     const goodMatches = allMatches
