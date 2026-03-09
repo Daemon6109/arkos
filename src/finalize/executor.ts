@@ -209,7 +209,15 @@ export async function runFinalizeExecutor(opts: ExecutorOptions): Promise<void> 
   }
 
   // 6. bun install + tsc validation
-  console.log(`\n📦 Running bun install...`);
+  // Write .npmrc with GitHub token for private package registry auth
+  const githubToken = process.env.GITHUB_TOKEN;
+  if (githubToken) {
+    const npmrc = `//npm.pkg.github.com/:_authToken=${githubToken}\n@king-studios-rbx:registry=https://npm.pkg.github.com\n`;
+    await writeRepoFile(cloneDir, ".npmrc", npmrc);
+    console.log(`\n📦 Running bun install (with GitHub Package Registry auth)...`);
+  } else {
+    console.log(`\n📦 Running bun install (no GITHUB_TOKEN — private packages may fail)...`);
+  }
   try {
     await execAsync("bun install", { cwd: cloneDir, timeout: 120_000 });
   } catch (err) {
