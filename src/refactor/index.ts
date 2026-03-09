@@ -131,11 +131,40 @@ Respond ONLY with valid JSON (no markdown, no extra text):
 
   const raw = await generate(
     prompt,
-    { model: "qwen3:14b", num_ctx: 16384, num_predict: 1024 },
+    { model: "qwen3:14b", num_ctx: 16384, num_predict: 2048 },
     "refactor_pass1"
   );
 
-  const result = parseJsonSafe<CandidateList>(raw, { candidates: [] });
+  // Always log raw model output for pass 1 (it's short enough)
+  log(`  🤖 Pass 1 raw output: ${raw.replace(/<think>[\s\S]*?<\/think>/g, "[thinking...]").slice(0, 400)}`);
+
+  // extractJson grabs arrays first — if model returns ["file.ts"] instead of
+  // {"candidates":["file.ts"]}, normalise it before parsing
+  const stripped = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+  const arrOnly = stripped.match(/^\s*\[[\s\S]*\]\s*$/);
+  const normalised = arrOnly ? `{"candidates":${stripped}}` : stripped;
+
+  const result = parseJsonSafe<CandidateList>(normalised, { candidates: [] });
+
+  // Also try pulling from raw fenced blocks if still empty
+  if (result.candidates.length === 0) {
+    const fenced = stripped.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenced) {
+      const inner = fenced[1].trim();
+      const alt = parseJsonSafe<CandidateList>(
+        inner.startsWith("[") ? `{"candidates":${inner}}` : inner,
+        { candidates: [] }
+      );
+      if (alt.candidates.length > 0) result.candidates.push(...alt.candidates);
+    }
+  }
+
+  // Last resort: extract quoted paths that look like file paths
+  if (result.candidates.length === 0) {
+    const paths = [...stripped.matchAll(/"((?:src|packages|lib|test)\/[^"]+\.[a-z]+)"/g)]
+      .map(m => m[1]);
+    if (paths.length > 0) result.candidates.push(...paths.slice(0, 15));
+  }
 
   log(`  📋 Pass 1 identified ${result.candidates.length} candidate files:`);
   for (const c of result.candidates) {
