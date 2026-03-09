@@ -3,6 +3,7 @@
 
 import { run } from "./kernel/index.js";
 import { getStats } from "./memory/index.js";
+import { startServer } from "./server/index.js";
 
 const args = process.argv.slice(2);
 
@@ -11,10 +12,12 @@ if (args.length === 0 || args[0] === "help") {
 arkos — Cognitive AI orchestration engine
 
 Usage:
-  arkos run <goal>       Run a goal through the full pipeline
-  arkos run <goal> -v    Verbose output
-  arkos status           Show memory stats
-  arkos help             Show this help
+  arkos run <goal>          Run a goal through the full pipeline
+  arkos run <goal> -v       Verbose output
+  arkos serve               Start HTTP API server (port 3847)
+  arkos serve --port 8080   Start on custom port
+  arkos status              Show memory stats
+  arkos help                Show this help
 `);
   process.exit(0);
 }
@@ -47,6 +50,11 @@ if (command === "run") {
     console.error("Arkos error:", err);
     process.exit(1);
   });
+} else if (command === "serve") {
+  const portIdx = args.indexOf("--port");
+  const port = portIdx !== -1 ? parseInt(args[portIdx + 1], 10) : 3847;
+  startServer(port);
+  // Keep process alive
 } else if (command === "status") {
   const stats = getStats();
   console.log("📊 Arkos Memory Stats");
@@ -55,5 +63,6 @@ if (command === "run") {
   console.log(`  Avg score: ${stats.avgScore.toFixed(2)}`);
 } else {
   console.error(`Unknown command: ${command}`);
+  console.error("Commands: run, serve, status, help");
   process.exit(1);
 }
