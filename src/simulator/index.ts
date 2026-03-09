@@ -20,20 +20,39 @@ import type { VisionObject, Persona, PersonaSimulation, SimulationStep } from ".
 export const DEFAULT_PERSONAS: Persona[] = [
   {
     name: "novice",
-    description:
-      "No tech background. Gets confused by jargon. Needs obvious affordances. Gives up easily if stuck. Uses products by feel, not by reading docs.",
+    description: [
+      "Retired teacher, 62 years old. Uses a smartphone but barely touches a computer.",
+      "SPECIFIC BEHAVIORS: Clicks random buttons to 'see what happens'. Reads nothing before acting.",
+      "Skips or dismisses every modal/tooltip without reading. Types slowly and makes typos.",
+      "When stuck, waits 30 seconds staring at the screen before trying anything else.",
+      "Will abandon the product if she hits the same wall twice. Cannot interpret error messages.",
+      "Expects everything to work like Facebook. Confused by non-obvious icons.",
+      "CONFUSION TRIGGERS: Any jargon (API, token, schema, config), multi-step flows without progress indicators, forms with no placeholder text.",
+    ].join(" "),
     techLevel: "novice",
   },
   {
     name: "hobbyist",
-    description:
-      "Some software experience. Can follow instructions. Not a developer. Will try a few things before giving up. Reads tooltips but not full docs.",
+    description: [
+      "25-year-old hobbyist developer. Builds side projects but doesn't code professionally.",
+      "SPECIFIC BEHAVIORS: Skims the README quickly, then jumps straight to trying things.",
+      "Will copy-paste code without fully understanding it. Reads error messages but often misinterprets them.",
+      "Opens the browser dev console when stuck. Tries 2-3 times before searching Google.",
+      "Gets frustrated by undocumented config options. Will accept minor friction but not repeated failures.",
+      "CONFUSION TRIGGERS: Inconsistent API naming, missing type hints, docs that assume knowledge he doesn't have, silent failures with no error output.",
+    ].join(" "),
     techLevel: "hobbyist",
   },
   {
     name: "developer",
-    description:
-      "Technical user. Wants power and control. Hates hand-holding. Will read source if needed. Frustrated by unnecessary friction or missing features.",
+    description: [
+      "Senior full-stack engineer, 8 years of experience. Has strong opinions.",
+      "SPECIFIC BEHAVIORS: Goes straight to the source code or API reference — ignores marketing copy.",
+      "Reads type signatures. Immediately notices missing exports, inconsistent naming, or leaky abstractions.",
+      "Runs the linter/type checker before reading docs. Highly irritated by anything that should 'just work' but doesn't.",
+      "Will file a bug report for poor DX but won't give up. Frustrated by hand-holding or over-abstraction.",
+      "CONFUSION TRIGGERS: Anything that breaks the principle of least surprise, hidden side effects, global state, poor TypeScript types, missing overloads.",
+    ].join(" "),
     techLevel: "developer",
   },
 ];
@@ -56,40 +75,62 @@ async function simulatePersona(
   vision: VisionObject,
   persona: Persona
 ): Promise<PersonaSimulation> {
-  const prompt = `You are simulating a real user interacting with a product for the first time.
+  const prompt = `You are a UX researcher running a realistic usability simulation. You must predict EXACTLY what a specific user does at each step — not what an ideal user would do.
 
-Product: ${vision.name}
+═══ PRODUCT ═══
+Name: ${vision.name}
 Description: ${vision.description}
 Components: ${vision.components.join(", ")}
 UX Flow: ${vision.uxFlow.join(" → ")}
 
-You are playing this persona:
+═══ USER PERSONA ═══
 Name: ${persona.name}
 Profile: ${persona.description}
 
-Simulate this persona going through the product step by step. Be realistic — show confusion, mistakes, friction, and moments of delight. Don't make it too smooth.
+═══ SIMULATION RULES ═══
+1. THINK STEP BY STEP before assigning any numbers.
+2. For each step, first describe the EXACT action this specific user takes (not what they should do — what THEY actually do given their background and habits).
+3. Describe what happens as a result (success, error, confusion, partial success).
+4. THEN assign friction and confusion scores using these anchors:
 
-For each step:
-- action: what the user does
-- outcome: what happens
-- friction: 0-10 (0=smooth, 10=completely stuck)
-- confusion: 0-10 (0=clear, 10=totally lost)
+FRICTION SCALE:
+  0   = Completely smooth — user does it correctly on first try with zero hesitation
+  1-2 = Minor bump — slight pause or small correction needed, user barely notices
+  3-4 = Noticeable friction — user has to think, re-read, or try again once
+  5-6 = Significant friction — user is visibly frustrated, multiple retries, nearly gives up
+  7-8 = Major blocker — user is stuck for a long time, considers quitting
+  9-10 = Wall — user gives up or cannot proceed at all
 
-Also identify:
-- blockers: things that would make this user quit
-- delights: moments that make them want to continue
+CONFUSION SCALE:
+  0   = Crystal clear — user knows exactly what to do
+  1-2 = Slight uncertainty — user guesses correctly
+  3-4 = Moderate confusion — user tries wrong things first
+  5-6 = High confusion — user doesn't understand what's being asked
+  7-8 = Very lost — user has no idea what to do next
+  9-10 = Complete bewilderment — user doesn't understand the product at all
 
-Respond ONLY with JSON:
+5. Be REALISTIC: Different personas should get VERY different scores. A novice hitting a technical setup step should score 8-9 friction. A developer hitting the same step might score 1-2.
+6. Include at least one step where this persona struggles significantly (friction ≥ 6).
+7. Include at least one step where they succeed easily (friction ≤ 2).
+8. Blockers = steps where this persona would likely quit for good.
+9. Delights = moments that give the user confidence or satisfaction.
+
+═══ OUTPUT FORMAT ═══
+Respond ONLY with valid JSON (no markdown, no explanation):
 {
   "steps": [
-    {"action": "...", "outcome": "...", "friction": 3, "confusion": 2},
-    ...
+    {
+      "action": "EXACT description of what THIS user does (be specific about mistakes, hesitations, misclicks)",
+      "outcome": "What actually happens as a result — include errors, confusion states, or partial successes",
+      "friction": <number 0-10 matching the scale above>,
+      "confusion": <number 0-10 matching the scale above>
+    }
   ],
-  "blockers": ["blocker1", "blocker2"],
-  "delights": ["delight1", "delight2"]
+  "blockers": ["specific scenario where this user would give up"],
+  "delights": ["specific moment where this user feels successful or impressed"]
 }`;
 
-  const raw = await generate(prompt, { model: "qwen3:8b", temperature: 0.8 });
+  const raw = await generate(prompt, { model: "qwen3:8b", temperature: 0.85, num_ctx: 6000 });
   const cleaned = stripThinking(raw);
 
   type RawSim = {

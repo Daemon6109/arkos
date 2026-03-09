@@ -3,12 +3,12 @@
 // Informed by memory — past lessons shape the vision before any execution begins.
 
 import { generate, stripThinking, parseJsonSafe } from "../ollama.js";
-import { getRecentLessons } from "../memory/index.js";
+import { getRelevantLessons } from "../memory/index.js";
 import type { VisionObject } from "../types.js";
 
 export async function generateVision(goal: string): Promise<VisionObject> {
-  // Pull recent lessons from memory to inform the vision
-  const lessons = getRecentLessons(8);
+  // Pull semantically relevant lessons from memory to inform the vision
+  const lessons = await getRelevantLessons(goal, 8);
   const memorySection = lessons.length > 0
     ? `\nLessons from past runs (use these to avoid known mistakes):\n${lessons.map((l) => `- ${l}`).join("\n")}\n`
     : "";

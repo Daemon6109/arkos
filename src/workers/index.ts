@@ -465,52 +465,139 @@ async function detectExternalDeps(
 }
 
 // ─── Interface validation ─────────────────────────────────────────────────────
-// Scan imports across files and warn about obvious mismatches.
+// Scan imports across files and auto-fix mismatches using qwen2.5-coder:14b.
 
 async function validateInterfaces(
   files: Map<string, string>,
   outputDir: string,
   lang: string
 ): Promise<void> {
-  const issues: string[] = [];
-
   // Build export map: filename → exported symbols
-  const exportMap = new Map<string, Set<string>>();
-  for (const [filename, content] of files) {
-    const exports = new Set<string>();
-    const exportRegex = /export\s+(?:function|const|class|interface|type|enum)\s+(\w+)/g;
-    let m;
-    while ((m = exportRegex.exec(content)) !== null) exports.add(m[1]);
-    exportMap.set(filename, exports);
-  }
+  const buildExportMap = (fileMap: Map<string, string>): Map<string, Set<string>> => {
+    const exportMap = new Map<string, Set<string>>();
+    for (const [filename, content] of fileMap) {
+      const exports = new Set<string>();
+      const exportRegex = /export\s+(?:function|const|class|interface|type|enum)\s+(\w+)/g;
+      let m;
+      while ((m = exportRegex.exec(content)) !== null) exports.add(m[1]);
+      exportMap.set(filename, exports);
+    }
+    return exportMap;
+  };
 
-  // Check imports against export map
-  for (const [filename, content] of files) {
-    const importRegex = /import\s+\{([^}]+)\}\s+from\s+['"](\.[^'"]+)['"]/g;
-    let m;
-    while ((m = importRegex.exec(content)) !== null) {
-      const importedSymbols = m[1].split(",").map(s => s.trim().split(" as ")[0].trim());
-      const fromPath = m[2];
-
-      // Resolve relative path to a key in our file map
-      const resolvedKey = `src/${fromPath.replace(/^\.\//, "").replace(/\.ts$/, "")}.ts`;
-      const availableExports = exportMap.get(resolvedKey);
-
-      if (availableExports) {
-        for (const sym of importedSymbols) {
-          if (!availableExports.has(sym)) {
-            issues.push(`  ⚠️  ${filename} imports '${sym}' from '${fromPath}' but it's not exported there`);
+  // Find mismatches: returns list of {importer, symbol, sourceKey, sourcePath}
+  const findMismatches = (
+    fileMap: Map<string, string>,
+    exportMap: Map<string, Set<string>>
+  ): Array<{ importer: string; symbol: string; sourceKey: string; fromPath: string }> => {
+    const mismatches: Array<{ importer: string; symbol: string; sourceKey: string; fromPath: string }> = [];
+    for (const [filename, content] of fileMap) {
+      const importRegex = /import\s+\{([^}]+)\}\s+from\s+['"](\.[^'"]+)['"]/g;
+      let m;
+      while ((m = importRegex.exec(content)) !== null) {
+        const importedSymbols = m[1].split(",").map(s => s.trim().split(" as ")[0].trim()).filter(Boolean);
+        const fromPath = m[2];
+        const resolvedKey = `src/${fromPath.replace(/^\.\//, "").replace(/\.ts$/, "")}.ts`;
+        const availableExports = exportMap.get(resolvedKey);
+        if (availableExports) {
+          for (const sym of importedSymbols) {
+            if (sym && !availableExports.has(sym)) {
+              mismatches.push({ importer: filename, symbol: sym, sourceKey: resolvedKey, fromPath });
+            }
           }
         }
       }
     }
+    return mismatches;
+  };
+
+  let exportMap = buildExportMap(files);
+  let mismatches = findMismatches(files, exportMap);
+
+  if (mismatches.length === 0) {
+    console.log("    ✓ Interface validation passed");
+    return;
   }
 
-  if (issues.length > 0) {
-    console.log("    Interface validation issues found:");
-    issues.forEach(i => console.log(i));
+  console.log(`    ⚠️  Interface validation: ${mismatches.length} mismatch(es) found — attempting auto-fix...`);
+
+  // Group mismatches by source file so we patch each file once
+  const bySourceFile = new Map<string, Array<{ importer: string; symbol: string }>>();
+  for (const m of mismatches) {
+    const existing = bySourceFile.get(m.sourceKey) ?? [];
+    existing.push({ importer: m.importer, symbol: m.symbol });
+    bySourceFile.set(m.sourceKey, existing);
+  }
+
+  for (const [sourceKey, issues] of bySourceFile) {
+    const sourceContent = files.get(sourceKey);
+    if (!sourceContent) {
+      console.log(`    ✗ Cannot patch '${sourceKey}' — file not in map`);
+      continue;
+    }
+
+    const symbols = [...new Set(issues.map(i => i.symbol))];
+    const importers = [...new Set(issues.map(i => i.importer))];
+    console.log(`    🔧 Patching '${sourceKey}' to export: ${symbols.join(", ")}`);
+
+    const patchPrompt = `You are a ${lang} engineer fixing a missing export bug.
+
+FILE TO PATCH: ${sourceKey}
+MISSING EXPORTS: ${symbols.join(", ")}
+
+These symbols are imported by: ${importers.join(", ")}
+But they are not exported from the source file.
+
+Current file content:
+\`\`\`${lang.toLowerCase()}
+${sourceContent}
+\`\`\`
+
+Your job:
+1. If the symbol is already defined (function, const, class, type, interface, enum) but missing the 'export' keyword, add 'export' to its declaration.
+2. If the symbol doesn't exist at all, add a minimal correct stub that exports it with the right shape based on its name and context.
+3. Do NOT change any existing exports or logic — only ADD the missing exports.
+4. Return ONLY the complete patched file in a single \`\`\`${lang.toLowerCase()}\`\`\` code block. No explanation.`;
+
+    const raw = await generate(patchPrompt, { model: "qwen2.5-coder:14b", temperature: 0.1, num_ctx: 8000 });
+    const patched = stripThinking(raw);
+
+    // Extract code block
+    const blocks: Array<{ lang: string; code: string }> = [];
+    const blockRegex = /```([a-zA-Z0-9]*)\n([\s\S]*?)```/g;
+    let bm;
+    while ((bm = blockRegex.exec(patched)) !== null) {
+      if (bm[2].trim().length > 10) blocks.push({ lang: bm[1] || "txt", code: bm[2].trim() });
+    }
+
+    if (blocks.length === 0) {
+      console.log(`    ✗ Model returned no code block for '${sourceKey}' — skipping`);
+      continue;
+    }
+
+    const patchedCode = blocks[0].code;
+    const fullPath = join(outputDir, sourceKey);
+
+    try {
+      await writeFile(fullPath, patchedCode, "utf-8");
+      files.set(sourceKey, patchedCode);
+      console.log(`    ✓ Patched '${sourceKey}' (+exports: ${symbols.join(", ")})`);
+    } catch (err) {
+      console.log(`    ✗ Failed to write patched file '${sourceKey}': ${err}`);
+    }
+  }
+
+  // Re-run validation to confirm fixes
+  exportMap = buildExportMap(files);
+  const remaining = findMismatches(files, exportMap);
+
+  if (remaining.length === 0) {
+    console.log("    ✓ Interface validation passed after patching");
   } else {
-    console.log("    ✓ Interface validation passed");
+    console.log(`    ⚠️  ${remaining.length} mismatch(es) remain after patching:`);
+    for (const m of remaining) {
+      console.log(`       ${m.importer} imports '${m.symbol}' from '${m.fromPath}' — still not exported`);
+    }
   }
 }
 

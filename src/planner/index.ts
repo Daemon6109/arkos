@@ -28,10 +28,57 @@ export async function buildPlan(
   // ── Phase 1: Generate file map ─────────────────────────────────────────────
   const fileMap = await generateFileMap(vision, language);
 
-  // ── Phase 2: Generate task graph bound to file map ─────────────────────────
-  const graph = await generateTaskGraph(vision, goals, fileMap, language);
+  // ── Phase 2: Tree search — generate 3 candidate task graphs and pick best ──
+  const CANDIDATE_TEMPS = [0.3, 0.5, 0.7] as const;
+  console.log(`🌳 Generating ${CANDIDATE_TEMPS.length} candidate plans via tree search...`);
 
-  return graph;
+  const candidates = await Promise.all(
+    CANDIDATE_TEMPS.map((temp) => generateTaskGraph(vision, goals, fileMap, language, temp))
+  );
+
+  const scores = candidates.map((g) => scorePlan(g.tasks, fileMap));
+
+  let bestIdx = 0;
+  for (let i = 1; i < scores.length; i++) {
+    if (scores[i] > scores[bestIdx]) bestIdx = i;
+  }
+
+  const winner = candidates[bestIdx];
+  console.log(
+    `✅ Best plan: candidate #${bestIdx + 1} (temp=${CANDIDATE_TEMPS[bestIdx]}) ` +
+    `score=${scores[bestIdx].toFixed(3)} — tasks=${winner.tasks.length} | ` +
+    `scores=[${scores.map((s) => s.toFixed(3)).join(", ")}]`
+  );
+
+  return winner;
+}
+
+/**
+ * Score a candidate task graph on four axes:
+ *  (a) task count   — more tasks = more thorough
+ *  (b) specificity  — avg description length
+ *  (c) dep coverage — fraction of tasks that depend on at least one other
+ *  (d) file coverage — fraction of file map entries targeted by some task
+ */
+function scorePlan(tasks: Task[], fileMap: FileMapEntry[]): number {
+  if (tasks.length === 0) return 0;
+
+  // (a) task count — normalized, cap at 10
+  const taskCountScore = Math.min(tasks.length / 10, 1.0);
+
+  // (b) task specificity — avg description length, normalized at 100 chars
+  const avgDescLen = tasks.reduce((s, t) => s + t.description.length, 0) / tasks.length;
+  const specificityScore = Math.min(avgDescLen / 100, 1.0);
+
+  // (c) dependency coverage
+  const tasksWithDeps = tasks.filter((t) => t.dependsOn.length > 0).length;
+  const depCoverage = tasks.length > 1 ? tasksWithDeps / tasks.length : 0;
+
+  // (d) file map coverage
+  const usedFiles = new Set(tasks.map((t) => t.targetFile).filter(Boolean));
+  const fileCoverage = fileMap.length > 0 ? usedFiles.size / fileMap.length : 0;
+
+  return taskCountScore + specificityScore + depCoverage + fileCoverage;
 }
 
 async function generateFileMap(
@@ -109,7 +156,8 @@ async function generateTaskGraph(
   vision: VisionObject,
   goals: ExtractedGoal[],
   fileMap: FileMapEntry[],
-  language: string
+  language: string,
+  temperature = 0.3
 ): Promise<TaskGraph> {
 
   const fileList = fileMap
@@ -150,7 +198,7 @@ Respond ONLY with JSON array:
   }
 ]`;
 
-  const raw = await generate(prompt, { model: "qwen3:14b", temperature: 0.3 });
+  const raw = await generate(prompt, { model: "qwen3:14b", temperature });
   const cleaned = stripThinking(raw);
 
   const jsonStr = (() => {
