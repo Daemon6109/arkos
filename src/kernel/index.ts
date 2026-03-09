@@ -9,7 +9,7 @@ import { simulate } from "../simulator/index.js";
 import { extractGoals } from "../goals/index.js";
 import { checkFeasibility } from "../feasibility/index.js";
 import { buildPlan, readyTasks } from "../planner/index.js";
-import { executeGraph } from "../workers/index.js";
+import { executeGraph, assembleProject } from "../workers/index.js";
 import { evaluate, CONFIDENCE_THRESHOLD, MAX_RETRIES } from "../evaluator/index.js";
 import { storeRun } from "../memory/index.js";
 import { generate, stripThinking } from "../ollama.js";
@@ -79,9 +79,12 @@ export async function run(goal: string, opts: RunOptions = {}): Promise<void> {
   }
 
   // ── 5. Plan ───────────────────────────────────────────────────────────────
-  console.log("[5/7] 📋  Building task graph...");
-  const graph = await buildPlan(vision, goals);
-  console.log(`  → ${graph.tasks.length} tasks planned`);
+  console.log("[5/7] 📋  Building task graph + file map...");
+  const graph = await buildPlan(vision, goals, language);
+  console.log(`  → ${graph.tasks.length} tasks | ${graph.fileMap.length} files planned`);
+  if (verbose) {
+    graph.fileMap.forEach(f => console.log(`    ${f.path} — ${f.description}`));
+  }
   if (verbose) {
     graph.tasks.forEach((t) => {
       const deps = t.dependsOn.length > 0 ? ` (after ${t.dependsOn.length} task(s))` : "";
@@ -96,6 +99,9 @@ export async function run(goal: string, opts: RunOptions = {}): Promise<void> {
 
   // Adaptive context retry loop
   results = await adaptiveRetry(results, graph, ctx, verbose);
+
+  // ── Assembly pass — writes package.json, tsconfig, wires project ──────────
+  await assembleProject(graph, ctx);
 
   // ── 7. Evaluate ───────────────────────────────────────────────────────────
   console.log("[7/7] 🔍  Evaluating output...");
@@ -166,9 +172,11 @@ async function adaptiveRetry(
       tasks: graph.tasks.filter((t) =>
         needsRetry.some((te) => te.taskId === t.id)
       ),
+      fileMap: graph.fileMap,
+      language: graph.language,
     };
 
-    const retryResults = await exec(retryGraph, ctx);
+    const retryResults = await exec(retryGraph, { ...ctx, language: graph.language });
 
     // Merge retry results into current results
     for (const retryResult of retryResults) {

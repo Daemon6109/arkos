@@ -21,11 +21,21 @@ export interface Task {
   dependsOn: string[];
   context: { files: string[]; notes: string };
   status: TaskStatus;
+  targetFile?: string;    // exact file this task writes — set by planner
+  exports?: string[];     // symbols this task exports (for import wiring)
+}
+
+export interface FileMapEntry {
+  path: string;           // e.g. "src/scanner.ts"
+  description: string;    // what this file contains
+  exports: string[];      // symbols it exports
 }
 
 export interface TaskGraph {
   goal: string;
   tasks: Task[];
+  fileMap: FileMapEntry[]; // full project file structure decided upfront
+  language: string;
 }
 
 export interface TaskResult {
