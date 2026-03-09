@@ -263,7 +263,27 @@ Respond ONLY with valid JSON (no markdown, no extra text):
     "refactor_pass2"
   );
 
-  return parseJsonSafe<RefactorPlan>(raw, fallback);
+  // Same direct-parse approach as pass 1 — bypass extractJson to avoid array-first bug
+  const stripped2 = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+  const clean2 = stripped2.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+
+  try {
+    const parsed = JSON.parse(clean2) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const p = parsed as Partial<RefactorPlan>;
+      return {
+        filesToMove: Array.isArray(p.filesToMove) ? p.filesToMove : [],
+        importsToUpdate: Array.isArray(p.importsToUpdate) ? p.importsToUpdate : [],
+        versionBumps: Array.isArray(p.versionBumps) ? p.versionBumps : [],
+        summary: typeof p.summary === "string" ? p.summary : "Plan parsed",
+      };
+    }
+  } catch {
+    // log raw for debugging
+    console.log(`  ⚠️  Pass 2 JSON parse failed. Raw (first 600):\n${stripped2.slice(0, 600)}`);
+  }
+
+  return fallback;
 }
 
 // ─── Verification step ────────────────────────────────────────────────────────
