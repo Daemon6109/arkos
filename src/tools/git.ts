@@ -62,11 +62,20 @@ export async function openPR(
   body: string,
   base = "main"
 ): Promise<string> {
-  const cmd = `gh pr create --title ${JSON.stringify(title)} --body ${JSON.stringify(body)} --base ${base}`;
-  const output = await run(cmd, repoDir);
-  // gh pr create outputs the PR URL as the last line
-  const lines = output.split("\n").filter(Boolean);
-  return lines[lines.length - 1] ?? output;
+  // Write body to a temp file to avoid shell interpretation of backticks/special chars
+  const { writeFile, unlink } = await import("fs/promises");
+  const { tmpdir } = await import("os");
+  const { join } = await import("path");
+  const tmpFile = join(tmpdir(), `arkos-pr-body-${Date.now()}.md`);
+  await writeFile(tmpFile, body, "utf8");
+  try {
+    const cmd = `gh pr create --title ${JSON.stringify(title)} --body-file ${JSON.stringify(tmpFile)} --base ${base}`;
+    const output = await run(cmd, repoDir);
+    const lines = output.split("\n").filter(Boolean);
+    return lines[lines.length - 1] ?? output;
+  } finally {
+    await unlink(tmpFile).catch(() => {});
+  }
 }
 
 /**
