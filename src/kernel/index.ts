@@ -142,8 +142,21 @@ export async function run(goal: string, opts: RunOptions = {}): Promise<void> {
     });
   }
 
+  // ── Acceptance Criteria ───────────────────────────────────────────────────
+  console.log("\n🔎 Running acceptance criteria...");
+  const criteria = generateCriteria(goal, graph.fileMap, ctx.language);
+  const acceptanceResult = await runAcceptance(criteria, ctx.outputDir);
+  console.log(acceptanceResult.report);
+  if (acceptanceResult.failing.length > 0) {
+    for (const c of acceptanceResult.failing) {
+      console.log(`  ❌ [${c.id}] ${c.description}`);
+    }
+  } else {
+    console.log("✅ All acceptance criteria met");
+  }
+
   // ── Memory ────────────────────────────────────────────────────────────────
-  await storeRun(goal, vision, evaluation);
+  await storeRun(goal, vision, evaluation, outputDir);
 
   // ── Project memory (per-directory) ────────────────────────────────────────
   const lessons = evaluation.taskEvaluations
