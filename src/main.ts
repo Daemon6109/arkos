@@ -23,16 +23,27 @@ const command = args[0];
 
 if (command === "run") {
   const verbose = args.includes("-v") || args.includes("--verbose");
-  const goalArgs = args.filter((a) => a !== "run" && a !== "-v" && a !== "--verbose");
+  const skipSim = args.includes("--no-sim");
+
+  // --lang TypeScript  or  --lang Python
+  const langIdx = args.indexOf("--lang");
+  const language = langIdx !== -1 ? args[langIdx + 1] : "TypeScript";
+
+  const goalArgs = args.filter((a, i) => {
+    if (["run", "-v", "--verbose", "--no-sim", "--lang"].includes(a)) return false;
+    if (langIdx !== -1 && i === langIdx + 1) return false; // skip the lang value
+    return true;
+  });
   const goal = goalArgs.join(" ").trim();
 
   if (!goal) {
     console.error("Error: please provide a goal");
     console.error('  arkos run "build a plugin manager for OpenClaw"');
+    console.error('  arkos run "build X" --lang Python --no-sim');
     process.exit(1);
   }
 
-  run(goal, { verbose }).catch((err) => {
+  run(goal, { verbose, skipSimulation: skipSim, language }).catch((err) => {
     console.error("Arkos error:", err);
     process.exit(1);
   });

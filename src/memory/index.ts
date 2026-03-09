@@ -1,5 +1,6 @@
 // ─── Memory System ────────────────────────────────────────────────────────────
 // Persistent storage of lessons, run results, and patterns.
+// Lessons from past runs feed back into the vision generator.
 // v1: JSON file-based. v2: Qdrant vector DB for semantic retrieval.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
@@ -14,10 +15,15 @@ interface RunRecord {
   overallScore: number;
   passed: boolean;
   lessons: string[];
+  outputDir?: string;
+}
+
+function memoryDir(): string {
+  return join(homedir(), ".arkos");
 }
 
 function memoryPath(): string {
-  return join(homedir(), ".arkos", "memory.json");
+  return join(memoryDir(), "memory.json");
 }
 
 function loadRecords(): RunRecord[] {
@@ -31,50 +37,71 @@ function loadRecords(): RunRecord[] {
 }
 
 function saveRecords(records: RunRecord[]): void {
-  const path = memoryPath();
-  mkdirSync(join(homedir(), ".arkos"), { recursive: true });
-  writeFileSync(path, JSON.stringify(records, null, 2), "utf-8");
+  mkdirSync(memoryDir(), { recursive: true });
+  writeFileSync(memoryPath(), JSON.stringify(records, null, 2), "utf-8");
 }
 
-function extractLessons(eval_: RunEvaluation): string[] {
+function extractLessons(eval_: RunEvaluation, goal: string): string[] {
   const lessons: string[] = [];
+
   for (const te of eval_.taskEvaluations) {
     if (te.overall < 0.5) {
-      lessons.push(`Low score (${te.overall.toFixed(2)}) on task ${te.taskId}: ${te.notes}`);
+      lessons.push(
+        `Low score (${te.overall.toFixed(2)}) on "${te.notes}" — consider more context`
+      );
     }
     if (te.action === "escalate") {
-      lessons.push(`Task required escalation: ${te.taskId}`);
+      lessons.push(`Task escalated and could not be auto-resolved: ${te.taskId}`);
+    }
+    if (te.action === "replan") {
+      lessons.push(`Task needed replanning — original plan was insufficient for goal type: ${goal}`);
     }
   }
+
   if (!eval_.passed) {
-    lessons.push(`Run did not meet threshold (score: ${eval_.overallScore.toFixed(2)})`);
+    lessons.push(
+      `Run for "${goal}" did not pass threshold (score: ${eval_.overallScore.toFixed(2)})`
+    );
   }
+
+  if (eval_.overallScore >= 0.9) {
+    lessons.push(`High-quality run (${eval_.overallScore.toFixed(2)}) for goal type: "${goal}"`);
+  }
+
   return lessons;
 }
 
 export async function storeRun(
   goal: string,
   vision: VisionObject,
-  evaluation: RunEvaluation
+  evaluation: RunEvaluation,
+  outputDir?: string
 ): Promise<void> {
   const records = loadRecords();
+
   records.push({
     timestamp: Date.now(),
     goal,
     visionName: vision.name,
     overallScore: evaluation.overallScore,
     passed: evaluation.passed,
-    lessons: extractLessons(evaluation),
+    lessons: extractLessons(evaluation, goal),
+    outputDir,
   });
-  saveRecords(records);
-  console.log(`💾 Run saved to memory (${records.length} total records)`);
+
+  // Keep last 50 records
+  const trimmed = records.slice(-50);
+  saveRecords(trimmed);
+
+  console.log(`💾 Run saved to memory (${trimmed.length} total records)`);
 }
 
 export function getRecentLessons(limit = 10): string[] {
   const records = loadRecords();
   return records
-    .slice(-limit)
-    .flatMap((r) => r.lessons);
+    .slice(-Math.ceil(limit * 2)) // look at recent records
+    .flatMap((r) => r.lessons)
+    .slice(-limit);               // return last N lessons
 }
 
 export function getStats(): { total: number; passed: number; avgScore: number } {
