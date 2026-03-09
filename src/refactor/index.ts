@@ -138,40 +138,34 @@ Respond ONLY with valid JSON (no markdown, no extra text):
   // Always log raw model output for pass 1 (it's short enough)
   log(`  🤖 Pass 1 raw output: ${raw.replace(/<think>[\s\S]*?<\/think>/g, "[thinking...]").slice(0, 400)}`);
 
-  // extractJson grabs arrays first — if model returns ["file.ts"] instead of
-  // {"candidates":["file.ts"]}, normalise it before parsing
   const stripped = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-  const arrOnly = stripped.match(/^\s*\[[\s\S]*\]\s*$/);
-  const normalised = arrOnly ? `{"candidates":${stripped}}` : stripped;
 
-  const result = parseJsonSafe<CandidateList>(normalised, { candidates: [] });
-
-  // Also try pulling from raw fenced blocks if still empty
-  if (result.candidates.length === 0) {
-    const fenced = stripped.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (fenced) {
-      const inner = fenced[1].trim();
-      const alt = parseJsonSafe<CandidateList>(
-        inner.startsWith("[") ? `{"candidates":${inner}}` : inner,
-        { candidates: [] }
-      );
-      if (alt.candidates.length > 0) result.candidates.push(...alt.candidates);
+  // Don't use extractJson here — it grabs inner arrays before outer objects.
+  // Parse directly and normalise whatever shape the model returned.
+  let candidates: string[] = [];
+  try {
+    // Strip optional ``` fences
+    const clean = stripped.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+    const parsed = JSON.parse(clean) as unknown;
+    if (Array.isArray(parsed)) {
+      candidates = parsed.filter((x): x is string => typeof x === "string");
+    } else if (parsed && typeof parsed === "object" && "candidates" in parsed) {
+      const c = (parsed as { candidates: unknown }).candidates;
+      if (Array.isArray(c)) candidates = c.filter((x): x is string => typeof x === "string");
     }
-  }
-
-  // Last resort: extract quoted paths that look like file paths
-  if (result.candidates.length === 0) {
-    const paths = [...stripped.matchAll(/"((?:src|packages|lib|test)\/[^"]+\.[a-z]+)"/g)]
+  } catch {
+    // Last resort: pull quoted file paths directly from the raw text
+    const paths = [...stripped.matchAll(/"((?:src|packages|lib|test)\/[^"]+\.[a-z]{1,5})"/g)]
       .map(m => m[1]);
-    if (paths.length > 0) result.candidates.push(...paths.slice(0, 15));
+    candidates = paths.slice(0, 15);
   }
 
-  log(`  📋 Pass 1 identified ${result.candidates.length} candidate files:`);
-  for (const c of result.candidates) {
+  log(`  📋 Pass 1 identified ${candidates.length} candidate files:`);
+  for (const c of candidates) {
     log(`    • ${c}`);
   }
 
-  return result.candidates;
+  return candidates;
 }
 
 // ─── Pass 2: Full refactor plan ───────────────────────────────────────────────
